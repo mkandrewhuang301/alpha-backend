@@ -22,7 +22,15 @@ def _get_auth_headers(method: str, path: str) -> dict:
     }
 
 
-async def get_markets(status: str = None, series_ticker: str = None, event_ticker: str = None, limit: int = None):
+def _handle_response(response: httpx.Response) -> dict:
+    if response.status_code != 200:
+        return {"error": True, "status_code": response.status_code, "detail": response.text}
+    if not response.content:
+        return {"error": True, "status_code": response.status_code, "detail": "Empty response"}
+    return response.json()
+
+
+async def get_markets(status: str = None, series_ticker: str = None, event_ticker: str = None, limit: int = None, cursor: str = None):
     path = "/trade-api/v2/markets"
     headers = _get_auth_headers("GET", path)
     url = f"{KALSHI_BASE_URL}/markets"
@@ -35,20 +43,45 @@ async def get_markets(status: str = None, series_ticker: str = None, event_ticke
         params["event_ticker"] = event_ticker
     if limit:
         params["limit"] = limit
+    if cursor:
+        params["cursor"] = cursor
     async with httpx.AsyncClient(timeout=30.0) as client:
         response = await client.get(url, headers=headers, params=params)
-        return response.json()
+        return _handle_response(response)
     
-async def get_series(category: str = None):
+async def get_series_list(
+    category: str = None,
+    tags: str = None,
+    include_product_metadata: bool = False,
+    include_volume: bool = False,
+):
     path = "/trade-api/v2/series"
     headers = _get_auth_headers("GET", path)
     url = f"{KALSHI_BASE_URL}/series"
     params = {}
     if category:
         params["category"] = category
+    if tags:
+        params["tags"] = tags
+    if include_product_metadata:
+        params["include_product_metadata"] = "true"
+    if include_volume:
+        params["include_volume"] = "true"
     async with httpx.AsyncClient(timeout=30.0) as client:
         response = await client.get(url, headers=headers, params=params)
-        return response.json()
+        return _handle_response(response)
+
+
+async def get_series_by_ticker(series_ticker: str, include_volume: bool = False):
+    path = f"/trade-api/v2/series/{series_ticker}"
+    headers = _get_auth_headers("GET", path)
+    url = f"{KALSHI_BASE_URL}/series/{series_ticker}"
+    params = {}
+    if include_volume:
+        params["include_volume"] = "true"
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.get(url, headers=headers, params=params)
+        return _handle_response(response)
 
 
 #get specific market  by ticker
@@ -58,4 +91,43 @@ async def get_market(ticker: str):
     url = f"{KALSHI_BASE_URL}/markets/{ticker}"
     async with httpx.AsyncClient(timeout=30.0) as client:
         response = await client.get(url, headers=headers)
-        return response.json()
+        return _handle_response(response)
+
+
+async def get_events(
+    limit: int = 200,
+    cursor: str = None,
+    with_nested_markets: bool = False,
+    with_milestones: bool = False,
+    status: str = None,
+    series_ticker: str = None,
+):
+    path = "/trade-api/v2/events"
+    headers = _get_auth_headers("GET", path)
+    url = f"{KALSHI_BASE_URL}/events"
+    params = {"limit": limit}
+    if cursor:
+        params["cursor"] = cursor
+    if with_nested_markets:
+        params["with_nested_markets"] = "true"
+    if with_milestones:
+        params["with_milestones"] = "true"
+    if status:
+        params["status"] = status
+    if series_ticker:
+        params["series_ticker"] = series_ticker
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.get(url, headers=headers, params=params)
+        return _handle_response(response)
+
+
+async def get_event(event_ticker: str, with_nested_markets: bool = False):
+    path = f"/trade-api/v2/events/{event_ticker}"
+    headers = _get_auth_headers("GET", path)
+    url = f"{KALSHI_BASE_URL}/events/{event_ticker}"
+    params = {}
+    if with_nested_markets:
+        params["with_nested_markets"] = "true"
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.get(url, headers=headers, params=params)
+        return _handle_response(response)
