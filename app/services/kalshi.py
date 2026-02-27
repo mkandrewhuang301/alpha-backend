@@ -72,7 +72,7 @@ async def get_series_list(
         return _handle_response(response)
 
 
-async def get_series_by_ticker(series_ticker: str, include_volume: bool = False):
+async def get_series(series_ticker: str, include_volume: bool = False):
     path = f"/trade-api/v2/series/{series_ticker}"
     headers = _get_auth_headers("GET", path)
     url = f"{KALSHI_BASE_URL}/series/{series_ticker}"

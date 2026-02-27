@@ -1,6 +1,6 @@
 from fastapi import APIRouter
 from typing import Optional
-from app.services.kalshi import get_series_list, get_series_by_ticker
+from app.services.kalshi import get_series_list, get_series
 
 router = APIRouter()
 
@@ -26,7 +26,7 @@ async def get_series_by_ticker(
     series_ticker: str,
     include_volume: bool = False,
 ):
-    data = await get_series_by_ticker(
+    data = await get_series(
         series_ticker=series_ticker,
         include_volume=include_volume,
     )
