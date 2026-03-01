@@ -8,13 +8,14 @@ Ingestion order MUST be: series → events → markets → outcomes.
 Markets reference events; events reference series. Violating this order
 will produce foreign key errors.
 
-This worker runs on startup (full sync) and then on a configurable interval
-(default: every 15 minutes) via APScheduler in app/core/scheduler.py.
-
-Live / historical price data is NOT synced here — see price_cache worker (TBD).
+Jobs:
+    - run_kalshi_full_sync: full backfill every 15 min (via arq cron)
+    - kalshi_state_reconciliation: delta sync every 1 min
+    - aggregate_ohlcv: Redis ticks → 1m candles every 1 min
 """
 
 import logging
+import time
 import uuid
 from datetime import datetime, timezone
 from typing import Optional
@@ -39,6 +40,9 @@ from app.services.kalshi import (
 logger = logging.getLogger(__name__)
 
 EXCHANGE = "kalshi"
+
+# Timestamp of the last state reconciliation run (epoch seconds)
+_last_reconciliation_ts: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -91,11 +95,11 @@ async def sync_series(session: AsyncSession) -> int:
     Fetch all Kalshi series and upsert into the series table.
     Returns the number of series processed.
     """
-    logger.info("[kalshi_ingest] Syncing series...")
+    logger.info("[kalshi.ingest] Syncing series...")
 
     raw = await get_series_list()
     if raw.get("error"):
-        logger.error("[kalshi_ingest] Failed to fetch series: %s", raw.get("detail"))
+        logger.error("[kalshi.ingest] Failed to fetch series: %s", raw.get("detail"))
         return 0
 
     series_list = [KalshiSeries(**s) for s in raw.get("series", [])]
@@ -133,10 +137,10 @@ async def sync_series(session: AsyncSession) -> int:
             await session.execute(stmt)
             count += 1
         except Exception as exc:
-            logger.error("[kalshi_ingest] Error upserting series %s: %s", s.ticker, exc)
+            logger.error("[kalshi.ingest] Error upserting series %s: %s", s.ticker, exc)
 
     await session.commit()
-    logger.info("[kalshi_ingest] Series sync complete: %d processed", count)
+    logger.info("[kalshi.ingest] Series sync complete: %d processed", count)
     return count
 
 
@@ -149,14 +153,14 @@ async def sync_events(session: AsyncSession) -> int:
     Fetch all Kalshi events (paginated) and upsert into the events table.
     Returns the number of events processed.
     """
-    logger.info("[kalshi_ingest] Syncing events...")
+    logger.info("[kalshi.ingest] Syncing events...")
     count = 0
     cursor = None
 
     while True:
         raw = await get_events(limit=200, cursor=cursor)
         if raw.get("error"):
-            logger.error("[kalshi_ingest] Failed to fetch events: %s", raw.get("detail"))
+            logger.error("[kalshi.ingest] Failed to fetch events: %s", raw.get("detail"))
             break
 
         batch = [KalshiEvent(**e) for e in raw.get("events", [])]
@@ -170,7 +174,7 @@ async def sync_events(session: AsyncSession) -> int:
                     series_id = await _get_series_id_by_ext(session, e.series_ticker)
                     if series_id is None:
                         logger.warning(
-                            "[kalshi_ingest] Series %s not found for event %s — skipping series_id",
+                            "[kalshi.ingest] Series %s not found for event %s — skipping series_id",
                             e.series_ticker, e.event_ticker,
                         )
 
@@ -209,7 +213,7 @@ async def sync_events(session: AsyncSession) -> int:
                 await session.execute(stmt)
                 count += 1
             except Exception as exc:
-                logger.error("[kalshi_ingest] Error upserting event %s: %s", e.event_ticker, exc)
+                logger.error("[kalshi.ingest] Error upserting event %s: %s", e.event_ticker, exc)
 
         await session.commit()
 
@@ -217,7 +221,7 @@ async def sync_events(session: AsyncSession) -> int:
         if not cursor:
             break
 
-    logger.info("[kalshi_ingest] Events sync complete: %d processed", count)
+    logger.info("[kalshi.ingest] Events sync complete: %d processed", count)
     return count
 
 
@@ -292,14 +296,14 @@ async def sync_markets(session: AsyncSession) -> int:
     Must run AFTER sync_events() so event_id foreign keys resolve.
     Returns the number of markets processed.
     """
-    logger.info("[kalshi_ingest] Syncing markets...")
+    logger.info("[kalshi.ingest] Syncing markets...")
     count = 0
     cursor = None
 
     while True:
         raw = await get_markets(limit=1000, cursor=cursor)
         if raw.get("error"):
-            logger.error("[kalshi_ingest] Failed to fetch markets: %s", raw.get("detail"))
+            logger.error("[kalshi.ingest] Failed to fetch markets: %s", raw.get("detail"))
             break
 
         batch = [KalshiMarket(**m) for m in raw.get("markets", [])]
@@ -309,13 +313,13 @@ async def sync_markets(session: AsyncSession) -> int:
         for m in batch:
             try:
                 if not m.event_ticker:
-                    logger.warning("[kalshi_ingest] Market %s has no event_ticker — skipping", m.ticker)
+                    logger.warning("[kalshi.ingest] Market %s has no event_ticker — skipping", m.ticker)
                     continue
 
                 event_id = await _get_event_id_by_ext(session, m.event_ticker)
                 if event_id is None:
                     logger.warning(
-                        "[kalshi_ingest] Event %s not found for market %s — skipping",
+                        "[kalshi.ingest] Event %s not found for market %s — skipping",
                         m.event_ticker, m.ticker,
                     )
                     continue
@@ -380,7 +384,7 @@ async def sync_markets(session: AsyncSession) -> int:
 
                 count += 1
             except Exception as exc:
-                logger.error("[kalshi_ingest] Error upserting market %s: %s", m.ticker, exc)
+                logger.error("[kalshi.ingest] Error upserting market %s: %s", m.ticker, exc)
                 await session.rollback()
 
         await session.commit()
@@ -389,7 +393,7 @@ async def sync_markets(session: AsyncSession) -> int:
         if not cursor:
             break
 
-    logger.info("[kalshi_ingest] Markets sync complete: %d processed", count)
+    logger.info("[kalshi.ingest] Markets sync complete: %d processed", count)
     return count
 
 
@@ -400,10 +404,10 @@ async def sync_markets(session: AsyncSession) -> int:
 async def run_kalshi_full_sync() -> None:
     """
     Run a complete Kalshi data sync: series → events → markets → outcomes.
-    This is called on startup and on a recurring schedule.
+    This is called on startup and on a recurring schedule via arq.
     Each sync stage gets its own session to avoid long-running transactions.
     """
-    logger.info("[kalshi_ingest] Starting full sync...")
+    logger.info("[kalshi.ingest] Starting full sync...")
 
     try:
         async with async_session_factory() as session:
@@ -415,6 +419,199 @@ async def run_kalshi_full_sync() -> None:
         async with async_session_factory() as session:
             await sync_markets(session)
 
-        logger.info("[kalshi_ingest] Full sync complete.")
+        logger.info("[kalshi.ingest] Full sync complete.")
     except Exception as exc:
-        logger.error("[kalshi_ingest] Full sync failed: %s", exc, exc_info=True)
+        logger.error("[kalshi.ingest] Full sync failed: %s", exc, exc_info=True)
+
+
+# ---------------------------------------------------------------------------
+# State reconciliation (delta sync)
+# ---------------------------------------------------------------------------
+
+async def kalshi_state_reconciliation(ctx: dict) -> None:
+    """
+    Delta sync: fetch only markets updated since the last reconciliation run.
+    Uses min_updated_ts param to get recently changed markets and upserts them.
+    Runs every 1 minute via arq cron.
+    """
+    global _last_reconciliation_ts
+
+    now_ts = int(time.time())
+    # On first run, look back 2 minutes
+    since_ts = _last_reconciliation_ts if _last_reconciliation_ts > 0 else now_ts - 120
+
+    logger.info("[kalshi.ingest] State reconciliation since ts=%d...", since_ts)
+
+    try:
+        cursor = None
+        total = 0
+
+        while True:
+            raw = await get_markets(limit=1000, cursor=cursor, min_updated_ts=since_ts)
+            if raw.get("error"):
+                logger.error("[kalshi.ingest] Reconciliation fetch failed: %s", raw.get("detail"))
+                break
+
+            batch = [KalshiMarket(**m) for m in raw.get("markets", [])]
+            if not batch:
+                break
+
+            async with async_session_factory() as session:
+                for m in batch:
+                    try:
+                        if not m.event_ticker:
+                            continue
+
+                        event_id = await _get_event_id_by_ext(session, m.event_ticker)
+                        if event_id is None:
+                            continue
+
+                        platform_metadata = {
+                            "strike_type": m.strike_type,
+                            "floor_strike": m.floor_strike,
+                            "cap_strike": m.cap_strike,
+                            "risk_limit_cents": m.risk_limit_cents,
+                            "settlement_timer_seconds": m.settlement_timer_seconds,
+                            "can_close_early": m.can_close_early,
+                            "response_price_units": m.response_price_units,
+                        }
+
+                        stmt = (
+                            pg_insert(Market)
+                            .values(
+                                id=uuid.uuid4(),
+                                event_id=event_id,
+                                exchange=EXCHANGE,
+                                ext_id=m.ticker,
+                                title=m.title,
+                                subtitle=m.subtitle,
+                                type=m.normalized_market_type,
+                                status=m.normalized_status,
+                                open_time=m.open_time,
+                                close_time=m.close_time,
+                                resolve_time=m.expiration_time,
+                                result=m.result,
+                                rules_primary=m.rules_primary,
+                                rules_secondary=m.rules_secondary,
+                                platform_metadata=platform_metadata,
+                                is_deleted=False,
+                            )
+                            .on_conflict_do_update(
+                                constraint="uq_markets_exchange_extid",
+                                set_={
+                                    "title": m.title,
+                                    "subtitle": m.subtitle,
+                                    "type": m.normalized_market_type,
+                                    "status": m.normalized_status,
+                                    "open_time": m.open_time,
+                                    "close_time": m.close_time,
+                                    "resolve_time": m.expiration_time,
+                                    "result": m.result,
+                                    "rules_primary": m.rules_primary,
+                                    "rules_secondary": m.rules_secondary,
+                                    "platform_metadata": platform_metadata,
+                                    "updated_at": datetime.now(timezone.utc),
+                                },
+                            )
+                        )
+                        await session.execute(stmt)
+                        await session.flush()
+
+                        market_id = await _get_market_id_by_ext(session, m.ticker)
+                        if market_id:
+                            await _upsert_outcomes_for_market(session, market_id, m)
+
+                        total += 1
+                    except Exception as exc:
+                        logger.error("[kalshi.ingest] Reconciliation error for %s: %s", m.ticker, exc)
+                        await session.rollback()
+
+                await session.commit()
+
+            cursor = raw.get("cursor")
+            if not cursor:
+                break
+
+        _last_reconciliation_ts = now_ts
+        logger.info("[kalshi.ingest] State reconciliation complete: %d markets updated", total)
+
+    except Exception as exc:
+        logger.error("[kalshi.ingest] State reconciliation failed: %s", exc, exc_info=True)
+
+
+# ---------------------------------------------------------------------------
+# OHLCV aggregation (Redis ticks → Postgres)
+# ---------------------------------------------------------------------------
+
+async def aggregate_ohlcv(ctx: dict) -> None:
+    """
+    Read latest tick prices from Redis HSET keys (market:{ticker}),
+    compute 1-minute OHLCV snapshots, and bulk insert to the market_ticks table.
+
+    Tick data format in Redis (set by WebSocket firehose):
+        HSET market:{ticker} best_bid best_ask last_price volume ts
+    """
+    redis = ctx.get("redis")
+    pool = ctx.get("asyncpg_pool")
+
+    if not redis or not pool:
+        logger.warning("[kalshi.ingest] OHLCV aggregation skipped — redis or pool not available")
+        return
+
+    try:
+        # Scan for all market:* keys in Redis
+        tick_keys = []
+        async for key in redis.scan_iter(match="market:*", count=500):
+            tick_keys.append(key)
+
+        if not tick_keys:
+            return
+
+        now = datetime.now(timezone.utc)
+        rows = []
+
+        for key in tick_keys:
+            data = await redis.hgetall(key)
+            if not data:
+                continue
+
+            ticker = key.replace("market:", "")
+            last_price = float(data.get("last_price", 0))
+            best_bid = float(data.get("best_bid", 0))
+            best_ask = float(data.get("best_ask", 0))
+            volume = int(data.get("volume", 0))
+
+            # For 1m candles from a single snapshot: OHLC are all the same price
+            rows.append((
+                ticker,
+                now,
+                last_price,  # open
+                last_price,  # high
+                last_price,  # low
+                last_price,  # close
+                volume,
+                best_bid,
+                best_ask,
+            ))
+
+        if rows:
+            async with pool.acquire() as conn:
+                await conn.executemany(
+                    """
+                    INSERT INTO market_ticks (ticker, ts, open, high, low, close, volume, best_bid, best_ask)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                    ON CONFLICT (ticker, ts) DO UPDATE SET
+                        high = GREATEST(market_ticks.high, EXCLUDED.high),
+                        low = LEAST(market_ticks.low, EXCLUDED.low),
+                        close = EXCLUDED.close,
+                        volume = EXCLUDED.volume,
+                        best_bid = EXCLUDED.best_bid,
+                        best_ask = EXCLUDED.best_ask
+                    """,
+                    rows,
+                )
+
+            logger.info("[kalshi.ingest] OHLCV aggregation: %d tickers written", len(rows))
+
+    except Exception as exc:
+        logger.error("[kalshi.ingest] OHLCV aggregation failed: %s", exc, exc_info=True)

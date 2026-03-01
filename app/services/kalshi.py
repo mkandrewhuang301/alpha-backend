@@ -1,98 +1,72 @@
-import httpx
-import base64
-import time
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import padding
-from app.core.config import KALSHI_API_KEY, KALSHI_PRIVATE_KEY, KALSHI_BASE_URL
+"""
+Kalshi API service — thin wrapper around kalshi-python-async SDK.
+
+The SDK handles RSA-PSS authentication, retries, and pagination internally.
+This module initialises the SDK client once and exposes async helper functions
+matching the signatures that workers and routes already call.
+"""
+
+import logging
+from typing import Any
+
+from kalshi_python_async import Configuration, KalshiClient
+
+from app.core.config import KALSHI_API_KEY, KALSHI_PRIVATE_KEY, KALSHI_BASE_API_URL
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# SDK client singleton
+# ---------------------------------------------------------------------------
+
+_client: KalshiClient | None = None
 
 
-def _get_auth_headers(method: str, path: str) -> dict:
-    timestamp_ms = str(int(time.time() * 1000))
-    message = timestamp_ms + method.upper() + path
-    private_key = serialization.load_pem_private_key(
-        KALSHI_PRIVATE_KEY.encode(), password=None
-    )
-    signature = private_key.sign(message.encode(), padding.PKCS1v15(), hashes.SHA256())
-    sig_b64 = base64.b64encode(signature).decode()
-    return {
-        "KALSHI-ACCESS-KEY": KALSHI_API_KEY,
-        "KALSHI-ACCESS-TIMESTAMP": timestamp_ms,
-        "KALSHI-ACCESS-SIGNATURE": sig_b64,
-        "Content-Type": "application/json",
-    }
+def _get_client() -> KalshiClient:
+    global _client
+    if _client is None:
+        config = Configuration(host=KALSHI_BASE_API_URL)
+        config.api_key_id = KALSHI_API_KEY
+        config.private_key_pem = KALSHI_PRIVATE_KEY
+        _client = KalshiClient(config)
+    return _client
 
 
-def _handle_response(response: httpx.Response) -> dict:
-    if response.status_code != 200:
-        return {"error": True, "status_code": response.status_code, "detail": response.text}
-    if not response.content:
-        return {"error": True, "status_code": response.status_code, "detail": "Empty response"}
-    return response.json()
+# ---------------------------------------------------------------------------
+# Series
+# ---------------------------------------------------------------------------
 
-
-async def get_markets(status: str = None, series_ticker: str = None, event_ticker: str = None, limit: int = None, cursor: str = None):
-    path = "/trade-api/v2/markets"
-    headers = _get_auth_headers("GET", path)
-    url = f"{KALSHI_BASE_URL}/markets"
-    params = {}
-    if status:
-        params["status"] = status
-    if series_ticker:
-        params["series_ticker"] = series_ticker
-    if event_ticker:
-        params["event_ticker"] = event_ticker
-    if limit:
-        params["limit"] = limit
-    if cursor:
-        params["cursor"] = cursor
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        response = await client.get(url, headers=headers, params=params)
-        return _handle_response(response)
-    
 async def get_series_list(
     category: str = None,
     tags: str = None,
     include_product_metadata: bool = False,
     include_volume: bool = False,
-):
-    path = "/trade-api/v2/series"
-    headers = _get_auth_headers("GET", path)
-    url = f"{KALSHI_BASE_URL}/series"
-    params = {}
-    if category:
-        params["category"] = category
-    if tags:
-        params["tags"] = tags
-    if include_product_metadata:
-        params["include_product_metadata"] = "true"
-    if include_volume:
-        params["include_volume"] = "true"
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        response = await client.get(url, headers=headers, params=params)
-        return _handle_response(response)
+) -> dict[str, Any]:
+    """Fetch all Kalshi series. Returns dict with 'series' key."""
+    try:
+        client = _get_client()
+        resp = await client.series_api.get_series()
+        return {"series": [s.to_dict() if hasattr(s, "to_dict") else s for s in (resp.series or [])]}
+    except Exception as exc:
+        logger.error("[kalshi] Failed to fetch series: %s", exc)
+        return {"error": True, "status_code": 500, "detail": str(exc)}
 
 
-async def get_series(series_ticker: str, include_volume: bool = False):
-    path = f"/trade-api/v2/series/{series_ticker}"
-    headers = _get_auth_headers("GET", path)
-    url = f"{KALSHI_BASE_URL}/series/{series_ticker}"
-    params = {}
-    if include_volume:
-        params["include_volume"] = "true"
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        response = await client.get(url, headers=headers, params=params)
-        return _handle_response(response)
+async def get_series(series_ticker: str, include_volume: bool = False) -> dict[str, Any]:
+    """Fetch a single series by ticker."""
+    try:
+        client = _get_client()
+        resp = await client.series_api.get_series_by_ticker(series_ticker)
+        data = resp.to_dict() if hasattr(resp, "to_dict") else resp
+        return data
+    except Exception as exc:
+        logger.error("[kalshi] Failed to fetch series %s: %s", series_ticker, exc)
+        return {"error": True, "status_code": 500, "detail": str(exc)}
 
 
-#get specific market  by ticker
-async def get_market(ticker: str):
-    path = f"/trade-api/v2/markets/{ticker}"
-    headers = _get_auth_headers("GET", path)
-    url = f"{KALSHI_BASE_URL}/markets/{ticker}"
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        response = await client.get(url, headers=headers)
-        return _handle_response(response)
-
+# ---------------------------------------------------------------------------
+# Events
+# ---------------------------------------------------------------------------
 
 async def get_events(
     limit: int = 200,
@@ -101,33 +75,89 @@ async def get_events(
     with_milestones: bool = False,
     status: str = None,
     series_ticker: str = None,
-):
-    path = "/trade-api/v2/events"
-    headers = _get_auth_headers("GET", path)
-    url = f"{KALSHI_BASE_URL}/events"
-    params = {"limit": limit}
-    if cursor:
-        params["cursor"] = cursor
-    if with_nested_markets:
-        params["with_nested_markets"] = "true"
-    if with_milestones:
-        params["with_milestones"] = "true"
-    if status:
-        params["status"] = status
-    if series_ticker:
-        params["series_ticker"] = series_ticker
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        response = await client.get(url, headers=headers, params=params)
-        return _handle_response(response)
+) -> dict[str, Any]:
+    """Fetch paginated events. Returns dict with 'events' and 'cursor' keys."""
+    try:
+        client = _get_client()
+        kwargs: dict[str, Any] = {"limit": limit}
+        if cursor:
+            kwargs["cursor"] = cursor
+        if with_nested_markets:
+            kwargs["with_nested_markets"] = True
+        if with_milestones:
+            kwargs["with_milestones"] = True
+        if status:
+            kwargs["status"] = status
+        if series_ticker:
+            kwargs["series_ticker"] = series_ticker
+
+        resp = await client.events_api.get_events(**kwargs)
+        events = [e.to_dict() if hasattr(e, "to_dict") else e for e in (resp.events or [])]
+        return {"events": events, "cursor": getattr(resp, "cursor", None)}
+    except Exception as exc:
+        logger.error("[kalshi] Failed to fetch events: %s", exc)
+        return {"error": True, "status_code": 500, "detail": str(exc)}
 
 
-async def get_event(event_ticker: str, with_nested_markets: bool = False):
-    path = f"/trade-api/v2/events/{event_ticker}"
-    headers = _get_auth_headers("GET", path)
-    url = f"{KALSHI_BASE_URL}/events/{event_ticker}"
-    params = {}
-    if with_nested_markets:
-        params["with_nested_markets"] = "true"
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        response = await client.get(url, headers=headers, params=params)
-        return _handle_response(response)
+async def get_event(event_ticker: str, with_nested_markets: bool = False) -> dict[str, Any]:
+    """Fetch a single event by ticker."""
+    try:
+        client = _get_client()
+        kwargs: dict[str, Any] = {}
+        if with_nested_markets:
+            kwargs["with_nested_markets"] = True
+        resp = await client.events_api.get_event(event_ticker, **kwargs)
+        data = resp.to_dict() if hasattr(resp, "to_dict") else resp
+        return data
+    except Exception as exc:
+        logger.error("[kalshi] Failed to fetch event %s: %s", event_ticker, exc)
+        return {"error": True, "status_code": 500, "detail": str(exc)}
+
+
+# ---------------------------------------------------------------------------
+# Markets
+# ---------------------------------------------------------------------------
+
+async def get_markets(
+    status: str = None,
+    series_ticker: str = None,
+    event_ticker: str = None,
+    limit: int = None,
+    cursor: str = None,
+    min_updated_ts: int = None,
+) -> dict[str, Any]:
+    """Fetch paginated markets. Returns dict with 'markets' and 'cursor' keys."""
+    try:
+        client = _get_client()
+        kwargs: dict[str, Any] = {}
+        if status:
+            kwargs["status"] = status
+        if series_ticker:
+            kwargs["series_ticker"] = series_ticker
+        if event_ticker:
+            kwargs["event_ticker"] = event_ticker
+        if limit:
+            kwargs["limit"] = limit
+        if cursor:
+            kwargs["cursor"] = cursor
+        if min_updated_ts is not None:
+            kwargs["min_close_ts"] = min_updated_ts
+
+        resp = await client.markets_api.get_markets(**kwargs)
+        markets = [m.to_dict() if hasattr(m, "to_dict") else m for m in (resp.markets or [])]
+        return {"markets": markets, "cursor": getattr(resp, "cursor", None)}
+    except Exception as exc:
+        logger.error("[kalshi] Failed to fetch markets: %s", exc)
+        return {"error": True, "status_code": 500, "detail": str(exc)}
+
+
+async def get_market(ticker: str) -> dict[str, Any]:
+    """Fetch a single market by ticker."""
+    try:
+        client = _get_client()
+        resp = await client
+        data = resp.to_dict() if hasattr(resp, "to_dict") else resp
+        return data
+    except Exception as exc:
+        logger.error("[kalshi] Failed to fetch market %s: %s", ticker, exc)
+        return {"error": True, "status_code": 500, "detail": str(exc)}

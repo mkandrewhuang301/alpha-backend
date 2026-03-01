@@ -1,5 +1,5 @@
 """
-Markets endpoints — data served from PostgreSQL (populated by kalshi_ingest worker).
+Markets endpoints — data served from PostgreSQL (populated by workers.kalshi.ingest).
 
 GET /markets              - list markets, filterable by exchange, status, event_ticker, series_ticker
 GET /markets/{ticker}     - single market by Kalshi ticker (ext_id), includes outcomes

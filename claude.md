@@ -85,18 +85,26 @@ The workers are more important than the API server for Alpha's core value propos
 ```
 iOS App (React Native)
       ↕ HTTPS/JSON
-FastAPI Backend (this repo)
+FastAPI Backend (web process)
       ↕
 ┌───────────────────────────────────────┐
 │ PostgreSQL (Supabase)                  │
 │  ├── series, events, markets, outcomes │
+│  ├── market_ticks (OHLCV candles)     │
 │  ├── users, accounts, tracked_entities│
 │  └── user_orders, public_trades       │
 └───────────────────────────────────────┘
       ↕ (workers populate DB continuously)
 ┌─────────────────────────────────────┐
+│ Redis                                │
+│  ├── arq job queue (worker process) │
+│  └── market:{ticker} HSET (ticks)   │
+└─────────────────────────────────────┘
+      ↕
+┌─────────────────────────────────────┐
 │ External APIs / Data Sources         │
-│ - Kalshi REST + WebSocket            │
+│ - Kalshi REST (via kalshi-python-async SDK) │
+│ - Kalshi WebSocket firehose          │
 │ - Polymarket REST + on-chain (MATIC) │
 │ - Sportradar / Rotowire (sports)     │
 │ - OpenAI GPT-4o (AI synthesis)       │
@@ -107,8 +115,15 @@ FastAPI Backend (this repo)
 
 **Data flow for market data:**
 ```
-Kalshi API/WS ──► kalshi_ingest worker ──► PostgreSQL ──► FastAPI routes ──► iOS app
+Kalshi WS ──► ticker channel ──► Redis HSET (real-time prices)
+Kalshi WS ──► market_lifecycle_v2 ──► PostgreSQL (status/result changes)
+arq cron  ──► kalshi_full_sync (15m) ──► PostgreSQL (full backfill)
+arq cron  ──► state_reconciliation (1m) ──► PostgreSQL (delta sync)
+arq cron  ──► aggregate_ohlcv (1m) ──► Redis ticks → PostgreSQL market_ticks
+PostgreSQL ──► FastAPI routes ──► iOS app
 ```
+
+**Write separation rule:** Tick-level price data goes to Redis (high frequency, ephemeral). Metadata and OHLCV candles go to PostgreSQL (durable). Routes read from PostgreSQL.
 
 The database is the single source of truth for all market data served to the frontend. Routes never call external APIs directly for market data — they query the DB, which workers keep up to date.
 
@@ -119,9 +134,12 @@ The database is the single source of truth for all market data served to the fro
 - **Framework**: FastAPI (Python 3.11+)
 - **Server**: Uvicorn
 - **Database**: Supabase PostgreSQL (via SQLAlchemy async + asyncpg)
-- **ORM**: SQLAlchemy 2.0 (async with `AsyncSession`)
-- **HTTP Client**: httpx (async)
-- **Background Jobs**: APScheduler (`AsyncIOScheduler`)
+- **ORM**: SQLAlchemy 2.0 (async with `AsyncSession`) — routes only
+- **Raw DB**: asyncpg pool — workers use `executemany()` for high-perf batch upserts
+- **Cache / Queue**: Redis (via `redis[hiredis]`) — tick data HSET cache + arq job queue
+- **Background Jobs**: arq (Redis-backed async worker, runs as separate process)
+- **Kalshi SDK**: `kalshi-python-async` — handles RSA auth, pagination internally
+- **Real-time**: WebSocket firehose (`websockets` library) to Kalshi for ticker + lifecycle events
 - **Push Notifications**: Firebase Cloud Messaging + APNs
 - **AI**: OpenAI API (GPT-4o)
 - **Sports Data**: Rotowire (MVP) → Sportradar (post traction)
@@ -135,7 +153,7 @@ The database is the single source of truth for all market data served to the fro
 ```
 alpha-backend/
 ├── app/
-│   ├── main.py                      # FastAPI entry point; lifespan manages scheduler
+│   ├── main.py                      # FastAPI entry point; lifespan manages WS + pools
 │   ├── api/
 │   │   └── routes/
 │   │       ├── markets.py           # Market endpoints — queries DB
@@ -151,22 +169,25 @@ alpha-backend/
 │   │   ├── kalshi.py                # Pydantic models for Kalshi API responses
 │   │   └── polymarket.py            # Pydantic models for Polymarket API responses
 │   ├── services/
-│   │   ├── kalshi.py                # Raw Kalshi API client (auth + HTTP calls)
+│   │   ├── kalshi.py                # Kalshi SDK wrapper (kalshi-python-async)
 │   │   ├── polymarket.py            # Polymarket on-chain data wrapper
 │   │   ├── sportradar.py            # Sports data wrapper
 │   │   ├── openai.py                # AI synthesis service
 │   │   ├── firebase.py              # Push notification service
 │   │   └── weather.py               # Weather API wrapper
 │   ├── workers/
-│   │   ├── kalshi_ingest.py         # Syncs series/events/markets/outcomes from Kalshi
+│   │   ├── kalshi/
+│   │   │   ├── ingest.py            # Syncs series/events/markets/outcomes + OHLCV aggregation
+│   │   │   └── stream.py            # WebSocket firehose: ticker → Redis, lifecycle → Postgres
 │   │   ├── injury_monitor.py        # Polls injury reports every 5 min
 │   │   ├── lineup_monitor.py        # Watches lineup releases
 │   │   ├── market_monitor.py        # Watches line movement and volume spikes
 │   │   └── whale_monitor.py         # Polymarket large position detection
 │   └── core/
 │       ├── config.py                # Loads all env variables
-│       ├── database.py              # Async SQLAlchemy engine + session factory
-│       └── scheduler.py             # Registers all background workers with APScheduler
+│       ├── database.py              # SQLAlchemy engine + raw asyncpg pool
+│       ├── redis.py                 # Redis async connection (arq queue + tick cache)
+│       └── arq_worker.py            # arq WorkerSettings + cron job registration
 ├── tests/
 ├── .env                             # Real keys — NEVER commit
 ├── .env.example                     # Template — commit this
@@ -238,8 +259,8 @@ Full SQL schema is in `/schema.sql`. ORM models live in `app/models/db.py`.
 ### External API Calls
 - All external API calls happen in `app/services/`. Routes and workers import from services — never use `httpx` directly in route handlers or workers.
 - Services should be thin wrappers: they handle auth, retries, and response normalisation. They do NOT contain business logic.
-- Use `httpx.AsyncClient` with a `timeout=30.0`. Never use sync `requests` library.
-- Kalshi authentication: RSA PKCS1v15 signature over `timestamp + method + path`. Auth logic is encapsulated in `services/kalshi.py::_get_auth_headers()`.
+- Kalshi REST: use `kalshi-python-async` SDK. Auth (RSA-PSS signing) is handled internally by the SDK. Singleton client in `services/kalshi.py::_get_client()`.
+- Kalshi WebSocket: separate implementation in `workers/kalshi/stream.py` using `websockets` library with manual RSA auth headers on connect.
 - Handle API errors explicitly: check status codes, log errors with context, return typed error responses. Never let an unhandled HTTP exception propagate to the route.
 - Rate limits: respect exchange rate limits. Add exponential backoff for retryable errors (5xx, 429).
 
@@ -254,12 +275,15 @@ Full SQL schema is in `/schema.sql`. ORM models live in `app/models/db.py`.
 - Numeric precision: monetary values use `NUMERIC(24, 8)` in DB and `Decimal` in Python. Prices use `NUMERIC(10, 6)`. Never use `float` for money.
 
 ### Worker Conventions
-- Workers are async functions, scheduled via `APScheduler AsyncIOScheduler` in `app/core/scheduler.py`.
-- Each worker gets its own `AsyncSession` from `async_session_factory()`. Never share sessions across workers.
+- Workers are async functions, scheduled via **arq** cron jobs in `app/core/arq_worker.py`.
+- arq runs as a **separate process** (`arq app.core.arq_worker.WorkerSettings`) — not inside the FastAPI event loop.
+- Each arq task receives a `ctx` dict containing `asyncpg_pool` and `redis` (initialized in `on_startup`).
+- For SQLAlchemy-based upserts, workers create their own `AsyncSession` from `async_session_factory()`.
 - Workers log at `INFO` level for normal operation, `WARNING` for skipped items, `ERROR` for failures.
-- Workers must not crash the scheduler on errors — wrap the body in `try/except Exception` and log.
+- Workers must not crash the process on errors — wrap the body in `try/except Exception` and log.
 - Ingestion order matters: always sync `series → events → markets → outcomes` in sequence. Markets reference events; events reference series.
-- On startup: run a full sync immediately before the scheduler starts its interval ticks.
+- On FastAPI startup: run a full sync immediately before serving requests. The WebSocket firehose also starts as a background task in the web process.
+- **Write separation:** tick-level price data → Redis HSET. Metadata/OHLCV → PostgreSQL.
 
 ### Route Conventions
 - Routes are thin: validate input, call a query or service, return a typed response. No business logic.
@@ -276,7 +300,7 @@ Full SQL schema is in `/schema.sql`. ORM models live in `app/models/db.py`.
 **Services are reusable, routes are specific.**
 - `services/kalshi.py` knows HOW to talk to Kalshi. Nothing else.
 - `routes/markets.py` knows WHAT URLs exist and maps DB data to response shapes.
-- `workers/kalshi_ingest.py` knows HOW to keep the DB in sync with Kalshi.
+- `workers/kalshi/ingest.py` knows HOW to keep the DB in sync with Kalshi.
 - `main.py` just assembles everything together.
 
 **The database is the source of truth.**
@@ -315,7 +339,8 @@ Only state the reason for a market move when the source is verifiable (injury re
 # Kalshi
 KALSHI_API_KEY_ID=
 KALSHI_PRIVATE_KEY=
-KALSHI_BASE_URL=https://trading-api.kalshi.com/trade-api/v2
+KALSHI_BASE_API_URL=https://api.elections.kalshi.com/trade-api/v2
+KALSHI_WS_URL=wss://api.elections.kalshi.com/trade-api/ws/v2
 
 # Polymarket
 POLYMARKET_API_KEY=
@@ -330,6 +355,9 @@ OPENAI_API_KEY=
 
 # Database (PostgreSQL via Supabase)
 DATABASE_URL=postgresql+asyncpg://postgres:[password]@db.[ref].supabase.co:5432/postgres
+
+# Redis (arq job queue + tick data cache)
+REDIS_URL=redis://localhost:6379
 
 # Firebase
 FIREBASE_CREDENTIALS_PATH=

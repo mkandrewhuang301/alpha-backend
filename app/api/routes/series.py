@@ -1,5 +1,5 @@
 """
-Series endpoints — data served from PostgreSQL (populated by kalshi_ingest worker).
+Series endpoints — data served from PostgreSQL (populated by workers.kalshi.ingest).
 
 GET /series            - list all series, filterable by exchange and category
 GET /series/{ticker}   - single series by Kalshi ticker (ext_id)

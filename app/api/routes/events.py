@@ -1,5 +1,5 @@
 """
-Events endpoints — data served from PostgreSQL (populated by kalshi_ingest worker).
+Events endpoints — data served from PostgreSQL (populated by workers.kalshi.ingest).
 
 GET /events            - list events, filterable by exchange, status, series_ticker
 GET /events/{ticker}   - single event by Kalshi ticker (ext_id)

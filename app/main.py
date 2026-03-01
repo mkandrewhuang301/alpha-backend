@@ -2,22 +2,28 @@
 Alpha Backend — FastAPI entry point.
 
 Startup sequence:
-    1. Register APScheduler jobs
+    1. Initialize asyncpg pool + Redis connection
     2. Run initial full Kalshi sync (populates DB before serving requests)
-    3. Start scheduler (repeating syncs every 15 min)
+    3. Start WebSocket firehose as background task
 
 Shutdown:
-    4. Stop scheduler cleanly
+    4. Cancel WebSocket task
+    5. Close Redis + asyncpg pool
+
+arq worker runs as a SEPARATE process (see Procfile).
 """
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
 from app.api.routes import events, markets, series
-from app.core.scheduler import register_jobs, scheduler
-from app.workers.kalshi_ingest import run_kalshi_full_sync
+from app.core.database import init_asyncpg_pool, close_asyncpg_pool
+from app.core.redis import get_redis, close_redis
+from app.workers.kalshi.ingest import run_kalshi_full_sync
+from app.workers.kalshi.stream import run_kalshi_ws
 
 logging.basicConfig(
     level=logging.INFO,
@@ -34,23 +40,33 @@ async def lifespan(app: FastAPI):
     """
     logger.info("Starting Alpha backend...")
 
-    # Register recurring background jobs
-    register_jobs()
+    # Initialize connection pools
+    await init_asyncpg_pool()
+    await get_redis()
+    logger.info("Connection pools ready (asyncpg + Redis).")
 
     # Run an immediate full Kalshi sync on startup so the DB is populated
     # before the app starts serving requests.
     logger.info("Running initial Kalshi sync...")
     await run_kalshi_full_sync()
 
-    # Start the scheduler (non-blocking — runs jobs in the background event loop)
-    scheduler.start()
-    logger.info("Scheduler started with %d jobs.", len(scheduler.get_jobs()))
+    # Start WebSocket firehose as a background task
+    ws_task = asyncio.create_task(run_kalshi_ws())
+    logger.info("WebSocket firehose started.")
 
     yield
 
     # Graceful shutdown
-    logger.info("Shutting down scheduler...")
-    scheduler.shutdown(wait=False)
+    logger.info("Shutting down...")
+    ws_task.cancel()
+    try:
+        await ws_task
+    except asyncio.CancelledError:
+        pass
+
+    await close_redis()
+    await close_asyncpg_pool()
+    logger.info("Shutdown complete.")
 
 
 app = FastAPI(
