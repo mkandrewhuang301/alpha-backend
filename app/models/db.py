@@ -1,8 +1,8 @@
 """
 SQLAlchemy ORM models mirroring the PostgreSQL schema.
 
-All ENUM types (exchange_type, market_status, etc.) are defined in PostgreSQL directly.
-SQLAlchemy references them with create_type=False to avoid re-creating them on startup.
+All ENUM types (exchange_type, market_status, etc.) are created automatically by
+SQLAlchemy's metadata.create_all() if they don't already exist in PostgreSQL.
 
 Three-level market hierarchy:
     Series → Events → Markets → MarketOutcomes
@@ -13,11 +13,12 @@ Supporting tables:
 """
 
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 
 from sqlalchemy import (
     Boolean,
     Column,
+    DateTime,
     Enum,
     ForeignKey,
     Numeric,
@@ -25,53 +26,52 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     Index,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import relationship
-from sqlalchemy.sql import func
-from sqlalchemy import DateTime
 
 from app.core.database import Base
 
 # ---------------------------------------------------------------------------
-# PostgreSQL ENUM type references (already created in DB — do not recreate)
+# PostgreSQL ENUM types (auto-created if not present)
 # ---------------------------------------------------------------------------
 
 exchange_enum = Enum(
     "kalshi", "polymarket",
-    name="exchange_type", create_type=False,
+    name="exchange_type",
 )
 
 platform_enum = Enum(
     "native_kalshi", "native_polymarket", "alpha_aggregator",
-    name="platform_type", create_type=False,
+    name="platform_type",
 )
 
 trade_side_enum = Enum(
     "no", "yes", "other",
-    name="trade_side", create_type=False,
+    name="trade_side",
 )
 
 order_action_enum = Enum(
     "buy", "sell",
-    name="order_action", create_type=False,
+    name="order_action",
 )
 
 market_type_enum = Enum(
     "binary", "categorical", "scalar",
-    name="market_type", create_type=False,
+    name="market_type",
 )
 
 order_status_enum = Enum(
     "pending_submission", "live", "partial", "matched_pending",
     "filled", "canceled", "expired", "rejected", "failed",
-    name="order_status", create_type=False,
+    name="order_status",
 )
 
 market_status_enum = Enum(
     "unopened", "active", "suspended", "closed",
     "in_dispute", "resolved", "canceled",
-    name="market_status", create_type=False,
+    name="market_status",
 )
 
 
@@ -85,8 +85,8 @@ class User(Base):
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     email = Column(String(255), unique=True, nullable=False)
     password_hash = Column(Text, nullable=False)
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    created_at = Column(DateTime(timezone=True), server_default=text("NOW()"))
+    updated_at = Column(DateTime(timezone=True), server_default=text("NOW()"), onupdate=lambda: datetime.now(timezone.utc))
 
     accounts = relationship("Account", back_populates="user")
     orders = relationship("UserOrder", back_populates="user")
@@ -103,7 +103,7 @@ class Account(Base):
     encrypted_api_secret = Column(Text)
     encrypted_passphrase = Column(Text)
     is_active = Column(Boolean, default=True)
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    created_at = Column(DateTime(timezone=True), server_default=text("NOW()"))
 
     __table_args__ = (
         UniqueConstraint("user_id", "exchange", "ext_account_id", name="uq_accounts_user_exchange_extid"),
@@ -126,7 +126,7 @@ class TrackedEntity(Base):
     external_identifier = Column(Text, nullable=False)
     alias = Column(Text)
     is_active = Column(Boolean, default=True)
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    created_at = Column(DateTime(timezone=True), server_default=text("NOW()"))
 
     __table_args__ = (
         UniqueConstraint("exchange", "external_identifier", name="uq_tracked_entities_exchange_extid"),
@@ -155,8 +155,8 @@ class Series(Base):
     image_url = Column(Text)
     frequency = Column(Text)                        # Kalshi: "daily", "weekly", "2y", etc.
     is_deleted = Column(Boolean, default=False)
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    created_at = Column(DateTime(timezone=True), server_default=text("NOW()"))
+    updated_at = Column(DateTime(timezone=True), server_default=text("NOW()"), onupdate=lambda: datetime.now(timezone.utc))
 
     __table_args__ = (
         UniqueConstraint("exchange", "ext_id", name="uq_series_exchange_extid"),
@@ -186,11 +186,17 @@ class Event(Base):
     expected_expiration_time = Column(DateTime(timezone=True))
     platform_metadata = Column(JSONB, default=dict)  # Neg Risk flags, MVP grouping rules, etc.
     is_deleted = Column(Boolean, default=False)
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    created_at = Column(DateTime(timezone=True), server_default=text("NOW()"))
+    updated_at = Column(DateTime(timezone=True), server_default=text("NOW()"), onupdate=lambda: datetime.now(timezone.utc))
 
     __table_args__ = (
         UniqueConstraint("exchange", "ext_id", name="uq_events_exchange_extid"),
+        Index(
+            "idx_active_events",
+            "exchange", "close_time",
+            postgresql_where=text("status = 'active'"),
+        ),
+        Index("idx_events_metadata_gin", "platform_metadata", postgresql_using="gin"),
     )
 
     series = relationship("Series", back_populates="events")
@@ -226,12 +232,17 @@ class Market(Base):
     platform_metadata = Column(JSONB, default=dict)
 
     is_deleted = Column(Boolean, default=False)
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    created_at = Column(DateTime(timezone=True), server_default=text("NOW()"))
+    updated_at = Column(DateTime(timezone=True), server_default=text("NOW()"), onupdate=lambda: datetime.now(timezone.utc))
 
     __table_args__ = (
         UniqueConstraint("exchange", "ext_id", name="uq_markets_exchange_extid"),
         Index("idx_markets_metadata_gin", "platform_metadata", postgresql_using="gin"),
+        Index(
+            "idx_active_markets_by_event",
+            "event_id", "type",
+            postgresql_where=text("status IN ('unopened', 'active')"),
+        ),
     )
 
     event = relationship("Event", back_populates="markets")
@@ -255,10 +266,11 @@ class MarketOutcome(Base):
     side = Column(trade_side_enum, nullable=False)
     is_winner = Column(Boolean, default=None)
     platform_metadata = Column(JSONB, default=dict)
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    created_at = Column(DateTime(timezone=True), server_default=text("NOW()"))
 
     __table_args__ = (
         UniqueConstraint("market_id", "execution_asset_id", name="uq_market_outcomes_market_asset"),
+        Index("idx_outcomes_market_lookup", "market_id"),
     )
 
     market = relationship("Market", back_populates="outcomes")
@@ -288,12 +300,13 @@ class PublicTrade(Base):
     timestamp = Column(DateTime(timezone=True), nullable=False)
 
     __table_args__ = (
-        Index("idx_public_trades_feed", "market_id", "timestamp"),
+        Index("idx_public_trades_recent", "market_id", text("timestamp DESC")),
         Index(
             "idx_public_trades_whale",
             "external_identifier",
             postgresql_where=(Column("size") > 10000),
         ),
+        Index("idx_public_trades_brin_ts", "timestamp", postgresql_using="brin"),
     )
 
     market = relationship("Market", back_populates="public_trades")
@@ -321,6 +334,9 @@ class UserOrder(Base):
     action = Column(order_action_enum, nullable=False)
     type = Column(String(20), nullable=False)            # "limit", "market", "fok", "ioc"
 
+    time_in_force = Column(String(20), default="gtc")    # e.g., 'gtc', 'ioc', 'fok', 'gtd'
+    expiration_time = Column(DateTime(timezone=True))    # Mandatory for 'gtd' orders
+
     requested_price = Column(Numeric(10, 6), nullable=False)
     requested_size = Column(Numeric(24, 8), nullable=False)
 
@@ -334,11 +350,16 @@ class UserOrder(Base):
     status = Column(order_status_enum, nullable=False, default="pending_submission")
     error_message = Column(Text)
 
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    created_at = Column(DateTime(timezone=True), server_default=text("NOW()"))
+    updated_at = Column(
+        DateTime(timezone=True),
+        server_default=text("NOW()"),
+        onupdate=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
 
     __table_args__ = (
-        Index("idx_user_orders_lookup", "user_id", "status", "created_at"),
+        Index("idx_user_orders_portfolio", "user_id", "status", text("created_at DESC")),
     )
 
     user = relationship("User", back_populates="orders")

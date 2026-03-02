@@ -90,7 +90,7 @@ class KalshiEvent(BaseModel):
     mutually_exclusive: Optional[bool] = False
     category: Optional[str] = None
     status: Optional[str] = None
-    strike_date: Optional[str] = None
+    strike_date: Optional[Any] = None
     strike_period: Optional[str] = None
     close_time: Optional[datetime] = None
     expected_expiration_time: Optional[datetime] = None

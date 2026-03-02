@@ -14,6 +14,9 @@ engine = create_async_engine(
     pool_size=10,
     max_overflow=20,
     echo=False,
+    connect_args={
+        "statement_cache_size": 0,
+    },
 )
 
 async_session_factory = async_sessionmaker(
@@ -21,6 +24,15 @@ async_session_factory = async_sessionmaker(
     class_=AsyncSession,
     expire_on_commit=False,
 )
+
+
+async def init_db() -> None:
+    """Create all tables and enum types if they don't already exist."""
+    # Import models so they register with Base.metadata
+    import app.models.db  # noqa: F401
+
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
 
 
 async def get_db() -> AsyncSession:

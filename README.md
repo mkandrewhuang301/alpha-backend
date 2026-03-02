@@ -145,7 +145,7 @@ Kalshi uses RSA key-based authentication. Each request is signed with a private 
    ```
 4. Run the server:
    ```bash
-   python -m uvicorn app.main:app --reload
+   python3 -m uvicorn app.main:app --reload
    ```
 5. Open `http://localhost:8000/docs` for interactive API explorer
 

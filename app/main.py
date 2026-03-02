@@ -13,17 +13,15 @@ Shutdown:
 arq worker runs as a SEPARATE process (see Procfile).
 """
 
-import asyncio
 import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
 from app.api.routes import events, markets, series
-from app.core.database import init_asyncpg_pool, close_asyncpg_pool
+from app.core.database import init_db, init_asyncpg_pool, close_asyncpg_pool
 from app.core.redis import get_redis, close_redis
 from app.workers.kalshi.ingest import run_kalshi_full_sync
-from app.workers.kalshi.stream import run_kalshi_ws
 
 logging.basicConfig(
     level=logging.INFO,
@@ -40,6 +38,10 @@ async def lifespan(app: FastAPI):
     """
     logger.info("Starting Alpha backend...")
 
+    # Create tables and enum types if they don't exist
+    await init_db()
+    logger.info("Database schema verified.")
+
     # Initialize connection pools
     await init_asyncpg_pool()
     await get_redis()
@@ -50,19 +52,10 @@ async def lifespan(app: FastAPI):
     logger.info("Running initial Kalshi sync...")
     await run_kalshi_full_sync()
 
-    # Start WebSocket firehose as a background task
-    ws_task = asyncio.create_task(run_kalshi_ws())
-    logger.info("WebSocket firehose started.")
-
     yield
 
     # Graceful shutdown
     logger.info("Shutting down...")
-    ws_task.cancel()
-    try:
-        await ws_task
-    except asyncio.CancelledError:
-        pass
 
     await close_redis()
     await close_asyncpg_pool()
