@@ -184,6 +184,8 @@ class Event(Base):
     mutually_exclusive = Column(Boolean, default=False)
     close_time = Column(DateTime(timezone=True))
     expected_expiration_time = Column(DateTime(timezone=True))
+    volume_24h = Column(Numeric(24, 8), default=0)
+    image_url = Column(Text)
     platform_metadata = Column(JSONB, default=dict)  # Neg Risk flags, MVP grouping rules, etc.
     is_deleted = Column(Boolean, default=False)
     created_at = Column(DateTime(timezone=True), server_default=text("NOW()"))

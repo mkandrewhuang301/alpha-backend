@@ -191,3 +191,34 @@ async def get_market(ticker: str) -> GetMarketResponse:
     except Exception as exc:
         logger.error("[kalshi] Failed to fetch market %s: %s", ticker, exc)
         raise
+
+
+# ---------------------------------------------------------------------------
+# Candlesticks
+# ---------------------------------------------------------------------------
+
+async def get_market_candlesticks(
+    event_ticker: str,
+    series_ticker: str,
+    start_ts: int,
+    end_ts: int,
+    period_interval: int = 1,
+):
+    """Fetch historical candlesticks from Kalshi REST API.
+
+    Uses get_market_candlesticks_by_event which returns OHLCV data
+    at the specified period_interval (1 = 1-minute candles).
+    """
+    try:
+        market_api = _get_market_api()
+        resp = await market_api.get_market_candlesticks_by_event(
+            ticker=event_ticker,
+            series_ticker=series_ticker,
+            start_ts=start_ts,
+            end_ts=end_ts,
+            period_interval=period_interval,
+        )
+        return resp
+    except Exception as exc:
+        logger.error("[kalshi] Failed to fetch candlesticks for %s: %s", event_ticker, exc)
+        raise

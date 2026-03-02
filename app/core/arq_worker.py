@@ -78,16 +78,24 @@ async def run_aggregate_ohlcv(ctx: dict) -> None:
     await aggregate_ohlcv(ctx)
 
 
+async def run_aggregate_event_volumes(ctx: dict) -> None:
+    """Sum market volumes per event and write to events.volume_24h."""
+    from app.workers.kalshi.ingest import aggregate_event_volumes
+    await aggregate_event_volumes(ctx)
+
+
 class WorkerSettings:
     functions = [
         run_kalshi_full_sync,
         run_kalshi_state_reconciliation,
         run_aggregate_ohlcv,
+        run_aggregate_event_volumes,
     ]
     cron_jobs = [
         cron(run_kalshi_full_sync, minute={0, 15, 30, 45}),
         cron(run_kalshi_state_reconciliation, minute=set(range(60)), unique=True),
         cron(run_aggregate_ohlcv, minute=set(range(60)), unique=True),
+        cron(run_aggregate_event_volumes, minute={0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55}),
     ]
     on_startup = startup
     on_shutdown = shutdown

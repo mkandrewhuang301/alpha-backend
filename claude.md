@@ -115,15 +115,21 @@ FastAPI Backend (web process)
 
 **Data flow for market data:**
 ```
-Kalshi WS ──► ticker channel ──► Redis HSET (real-time prices)
+Kalshi WS ──► ticker channel ──► Redis HSET (real-time prices) + Redis candle (live OHLCV)
 Kalshi WS ──► market_lifecycle_v2 ──► PostgreSQL (status/result changes)
 arq cron  ──► kalshi_full_sync (15m) ──► PostgreSQL (full backfill)
 arq cron  ──► state_reconciliation (1m) ──► PostgreSQL (delta sync)
-arq cron  ──► aggregate_ohlcv (1m) ──► Redis ticks → PostgreSQL market_ticks
-PostgreSQL ──► FastAPI routes ──► iOS app
+Kalshi REST ──► historical candlesticks (on-demand per API request)
+PostgreSQL + Redis ──► FastAPI routes ──► iOS app
 ```
 
-**Write separation rule:** Tick-level price data goes to Redis (high frequency, ephemeral). Metadata and OHLCV candles go to PostgreSQL (durable). Routes read from PostgreSQL.
+**Hybrid OHLCV Candlestick Strategy:**
+- **Historical candles**: Fetched from Kalshi REST API on-demand (pre-computed, no wasted compute)
+- **Live candle**: Aggregated in Redis from WebSocket ticks using atomic Lua script (key: `candle:kalshi:{ticker}:{minute_ts}`, 5-min TTL)
+- **Merged endpoint**: `GET /api/v1/kalshi/events/{event_ticker}/candlesticks` merges both sources — overwrites or appends the live candle to the historical array
+- All prices normalized to $1.00 base (0.0-1.0) before returning to frontend
+
+**Write separation rule:** Tick-level price data goes to Redis (high frequency, ephemeral). Metadata goes to PostgreSQL (durable). OHLCV candles use a hybrid: historical from Kalshi REST, live from Redis. Routes read from PostgreSQL + Redis.
 
 The database is the single source of truth for all market data served to the frontend. Routes never call external APIs directly for market data — they query the DB, which workers keep up to date.
 
@@ -159,26 +165,31 @@ alpha-backend/
 │   │       ├── markets.py           # Market endpoints — queries DB
 │   │       ├── series.py            # Series endpoints — queries DB
 │   │       ├── events.py            # Event endpoints — queries DB
-│   │       ├── sports.py            # Injuries, lineups, stats, weather, refs
-│   │       ├── traders.py           # Sharp trader leaderboard, profiles
-│   │       ├── users.py             # Auth, positions, portfolio
-│   │       ├── groups.py            # Group betting social layer
-│   │       └── notifications.py     # Notification history and preferences
+│   │       ├── v1/                  # Versioned endpoints (DB + Redis live data)
+│   │       │   ├── events.py        # /api/v1/{exchange}/events — live prices merged
+│   │       │   └── candlesticks.py  # /api/v1/kalshi/events/{ticker}/candlesticks — hybrid OHLCV
+│   │       ├── sports.py            # Injuries, lineups, stats, weather, refs (planned)
+│   │       ├── traders.py           # Sharp trader leaderboard, profiles (planned)
+│   │       ├── users.py             # Auth, positions, portfolio (planned)
+│   │       ├── groups.py            # Group betting social layer (planned)
+│   │       └── notifications.py     # Notification history and preferences (planned)
 │   ├── models/
 │   │   ├── db.py                    # SQLAlchemy ORM models (one per DB table)
 │   │   ├── kalshi.py                # Pydantic models for Kalshi API responses
 │   │   └── polymarket.py            # Pydantic models for Polymarket API responses
 │   ├── services/
-│   │   ├── kalshi.py                # Kalshi SDK wrapper (kalshi-python-async)
-│   │   ├── polymarket.py            # Polymarket on-chain data wrapper
-│   │   ├── sportradar.py            # Sports data wrapper
-│   │   ├── openai.py                # AI synthesis service
-│   │   ├── firebase.py              # Push notification service
-│   │   └── weather.py               # Weather API wrapper
+│   │   ├── kalshi.py                # Kalshi SDK wrapper (REST API + candlesticks)
+│   │   ├── events.py                # Event query logic + Redis price enrichment
+│   │   ├── candlesticks.py          # Hybrid candle aggregation (historical + live merge)
+│   │   ├── polymarket.py            # Polymarket on-chain data wrapper (planned)
+│   │   ├── sportradar.py            # Sports data wrapper (planned)
+│   │   ├── openai.py                # AI synthesis service (planned)
+│   │   ├── firebase.py              # Push notification service (planned)
+│   │   └── weather.py               # Weather API wrapper (planned)
 │   ├── workers/
 │   │   ├── kalshi/
 │   │   │   ├── ingest.py            # Syncs series/events/markets/outcomes + OHLCV aggregation
-│   │   │   └── stream.py            # WebSocket firehose: ticker → Redis, lifecycle → Postgres
+│   │   │   └── stream.py            # WebSocket firehose: ticker → Redis + live candles, lifecycle → Postgres
 │   │   ├── injury_monitor.py        # Polls injury reports every 5 min
 │   │   ├── lineup_monitor.py        # Watches lineup releases
 │   │   ├── market_monitor.py        # Watches line movement and volume spikes
@@ -286,12 +297,25 @@ Full SQL schema is in `/schema.sql`. ORM models live in `app/models/db.py`.
 - **Write separation:** tick-level price data → Redis HSET. Metadata/OHLCV → PostgreSQL.
 
 ### Route Conventions
-- Routes are thin: validate input, call a query or service, return a typed response. No business logic.
+- Routes are thin: validate input, call a service function, return a typed response. No business logic in route handlers.
+- V1 routes live in `app/api/routes/v1/`. Basic routes live in `app/api/routes/`.
 - Use `Depends(get_db)` for all routes that need DB access.
 - Routes query the DB (via SQLAlchemy) — they do NOT call external APIs directly for market data.
 - If a resource doesn't exist in the DB, return `404` with a clear message. Do not fall back to calling the exchange API.
 - Use `select()` with explicit column loading. Avoid `session.execute(text(...))` raw SQL unless absolutely necessary.
 - Filter by `is_deleted = False` on every query.
+
+### Service Layer Pattern
+- **API service wrappers** (`services/kalshi.py`): Thin wrappers around external SDKs/APIs. Handle auth, retries, error logging. No business logic.
+- **Domain services** (`services/events.py`, `services/candlesticks.py`): Handle the heavy lifting — DB queries, Redis enrichment, data merging. Called by route handlers.
+- Routes import from services and delegate all query/merge logic. Routes only handle request validation and response serialization.
+- When adding new endpoints, create or extend a service file for the domain logic, then write a thin route handler that calls it.
+
+### Candlestick Caching Pattern
+- **Live candle aggregation**: WebSocket ticker handler calls `update_live_candle()` on every tick, which runs an atomic Lua script in Redis to maintain current-minute OHLCV at key `candle:kalshi:{ticker}:{minute_ts}` with 5-min TTL.
+- **Historical candles**: Fetched on-demand from Kalshi REST API via `services/kalshi.py::get_market_candlesticks()`.
+- **Merge**: `services/candlesticks.py::get_merged_candlesticks()` combines both — overwrites the current minute if it exists in historical data, or appends if not.
+- Prices stored in Redis as integer basis points (0-10000) for Lua integer math; normalized to 0.0-1.0 floats on read.
 
 ---
 
@@ -299,7 +323,9 @@ Full SQL schema is in `/schema.sql`. ORM models live in `app/models/db.py`.
 
 **Services are reusable, routes are specific.**
 - `services/kalshi.py` knows HOW to talk to Kalshi. Nothing else.
-- `routes/markets.py` knows WHAT URLs exist and maps DB data to response shapes.
+- `services/events.py` knows HOW to query and enrich event data. Routes call it.
+- `services/candlesticks.py` knows HOW to merge historical + live candles.
+- `routes/v1/events.py` knows WHAT URLs exist and maps service output to response shapes.
 - `workers/kalshi/ingest.py` knows HOW to keep the DB in sync with Kalshi.
 - `main.py` just assembles everything together.
 
@@ -373,6 +399,7 @@ ENVIRONMENT=development
 1. ✅ Kalshi API connection — RSA auth, GET endpoints working
 2. ✅ Market data ingestion — series/events/markets syncing into PostgreSQL via background worker
 3. ✅ Routes serve from DB — all market endpoints query PostgreSQL
+3b. ✅ Hybrid OHLCV candlestick endpoint — Kalshi historical + Redis live candle merge
 4. Supabase user model — basic auth, user table
 5. Sports data pipeline — Rotowire injury feed flowing
 6. Background worker — injury detection running every 5 minutes

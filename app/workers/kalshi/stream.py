@@ -23,9 +23,11 @@ from cryptography.hazmat.primitives.asymmetric import padding
 
 from app.core.config import KALSHI_API_KEY, KALSHI_PRIVATE_KEY, KALSHI_WS_URL
 from app.core.database import async_session_factory
+from app.core.market_cache import MarketCacheManager, _normalize_cents
 from app.core.redis import get_redis
 from app.models.db import Market
-from app.models.kalshi import KalshiMarket, map_kalshi_status
+from app.models.kalshi import map_kalshi_status
+from app.services.candlesticks import update_live_candle
 
 logger = logging.getLogger(__name__)
 
@@ -52,22 +54,48 @@ def _ws_auth_headers() -> dict[str, str]:
     }
 
 
-async def _handle_ticker(msg: dict) -> None:
-    """Write ticker update to Redis HSET."""
+async def _handle_ticker(msg: dict, cache: MarketCacheManager, redis_conn) -> None:
+    """Write per-outcome ticker updates to Redis via MarketCacheManager + live candle."""
     try:
         data = msg.get("msg", {})
         ticker = data.get("market_ticker")
         if not ticker:
             return
 
-        redis = await get_redis()
-        await redis.hset(f"market:{ticker}", mapping={
-            "best_bid": str(data.get("yes_bid", 0)),
-            "best_ask": str(data.get("yes_ask", 0)),
-            "last_price": str(data.get("last_price", 0)),
-            "volume": str(data.get("volume", 0)),
-            "ts": str(int(time.time())),
+        ts = str(int(time.time()))
+        last_price = data.get("last_price", 0) or 0
+        volume_raw = data.get("volume", 0) or 0
+        volume = str(volume_raw)
+
+        # Yes side
+        await cache.update_ticker("kalshi", f"{ticker}-yes", {
+            "price": _normalize_cents(last_price),
+            "bid": _normalize_cents(data.get("yes_bid", 0)),
+            "bid_size": str(data.get("yes_bid_size", 0)),
+            "ask": _normalize_cents(data.get("yes_ask", 0)),
+            "ask_size": str(data.get("yes_ask_size", 0)),
+            "volume_24h": volume,
+            "ts": ts,
         })
+
+        # No side
+        await cache.update_ticker("kalshi", f"{ticker}-no", {
+            "price": _normalize_cents(100 - int(last_price)),
+            "bid": _normalize_cents(data.get("no_bid", 0)),
+            "bid_size": str(data.get("no_bid_size", 0)),
+            "ask": _normalize_cents(data.get("no_ask", 0)),
+            "ask_size": str(data.get("no_ask_size", 0)),
+            "volume_24h": volume,
+            "ts": ts,
+        })
+
+        # Live candle aggregation: update current-minute OHLCV in Redis
+        await update_live_candle(
+            redis_conn=redis_conn,
+            market_ticker=ticker,
+            last_price_cents=int(last_price),
+            volume=int(volume_raw),
+        )
     except Exception as exc:
         logger.error("[kalshi.stream] Error handling ticker: %s", exc)
 
@@ -115,7 +143,7 @@ async def _handle_market_lifecycle(msg: dict) -> None:
         logger.error("[kalshi.stream] Error handling lifecycle: %s", exc)
 
 
-async def _dispatch_message(raw: str) -> None:
+async def _dispatch_message(raw: str, cache: MarketCacheManager, redis_conn) -> None:
     """Route an incoming WebSocket message to the appropriate handler."""
     try:
         msg = json.loads(raw)
@@ -125,7 +153,7 @@ async def _dispatch_message(raw: str) -> None:
 
     msg_type = msg.get("type")
     if msg_type == "ticker":
-        await _handle_ticker(msg)
+        await _handle_ticker(msg, cache, redis_conn)
     elif msg_type == "market_lifecycle_v2":
         await _handle_market_lifecycle(msg)
 
@@ -136,6 +164,11 @@ async def run_kalshi_ws() -> None:
     Intended to be run as an asyncio.create_task() from FastAPI lifespan.
     """
     backoff = INITIAL_BACKOFF
+
+    # Create cache manager once for the lifetime of the WS connection
+    redis = await get_redis()
+    cache = MarketCacheManager(redis)
+    redis_conn = redis  # same connection for live candle aggregation
 
     while True:
         try:
@@ -163,7 +196,7 @@ async def run_kalshi_ws() -> None:
                 logger.info("[kalshi.stream] Subscribed to ticker + market_lifecycle_v2")
 
                 async for raw_msg in ws:
-                    await _dispatch_message(raw_msg)
+                    await _dispatch_message(raw_msg, cache, redis_conn)
 
         except asyncio.CancelledError:
             logger.info("[kalshi.stream] Task cancelled, shutting down.")

@@ -351,6 +351,7 @@ def _build_market_row(m: KalshiMarket, event_id: uuid.UUID, now: datetime) -> tu
         "settlement_timer_seconds": m.settlement_timer_seconds,
         "can_close_early": m.can_close_early,
         "response_price_units": m.response_price_units,
+        "volume_24h": m.volume_24h if hasattr(m, "volume_24h") else None,
     }
 
     return (
@@ -749,9 +750,9 @@ async def aggregate_ohlcv(ctx: dict) -> None:
         return
 
     try:
-        # Scan for all market:* keys in Redis
+        # Scan for all ticker:kalshi:*-yes keys (only yes side to avoid double-counting)
         tick_keys = []
-        async for key in redis.scan_iter(match="market:*", count=500):
+        async for key in redis.scan_iter(match="ticker:kalshi:*-yes", count=500):
             tick_keys.append(key)
 
         if not tick_keys:
@@ -765,20 +766,24 @@ async def aggregate_ohlcv(ctx: dict) -> None:
             if not data:
                 continue
 
-            ticker = key.replace("market:", "")
-            last_price = float(data.get("last_price", 0))
-            best_bid = float(data.get("best_bid", 0))
-            best_ask = float(data.get("best_ask", 0))
-            volume = int(data.get("volume", 0))
+            # Extract market ticker from key: ticker:kalshi:{market_ticker}-yes
+            # Remove prefix "ticker:kalshi:" and suffix "-yes"
+            raw = key[len("ticker:kalshi:"):]
+            ticker = raw[:-len("-yes")]
+
+            price = float(data.get("price", 0))
+            best_bid = float(data.get("bid", 0))
+            best_ask = float(data.get("ask", 0))
+            volume = int(data.get("volume_24h", 0))
 
             # For 1m candles from a single snapshot: OHLC are all the same price
             rows.append((
                 ticker,
                 now,
-                last_price,  # open
-                last_price,  # high
-                last_price,  # low
-                last_price,  # close
+                price,     # open
+                price,     # high
+                price,     # low
+                price,     # close
                 volume,
                 best_bid,
                 best_ask,
@@ -805,3 +810,41 @@ async def aggregate_ohlcv(ctx: dict) -> None:
 
     except Exception as exc:
         logger.error("[kalshi.ingest] OHLCV aggregation failed: %s", exc, exc_info=True)
+
+
+# ---------------------------------------------------------------------------
+# Event volume aggregation
+# ---------------------------------------------------------------------------
+
+async def aggregate_event_volumes(ctx: dict) -> None:
+    """
+    Sum volume_24h from each event's child markets (stored in platform_metadata)
+    and write the total to events.volume_24h.
+
+    Runs every 5 minutes via arq cron.
+    """
+    pool = ctx.get("asyncpg_pool")
+    if not pool:
+        pool = await get_asyncpg_pool()
+
+    try:
+        async with pool.acquire() as conn:
+            result = await conn.execute("""
+                UPDATE events e
+                SET volume_24h = sub.total_vol,
+                    updated_at = NOW()
+                FROM (
+                    SELECT
+                        m.event_id,
+                        COALESCE(SUM((m.platform_metadata->>'volume_24h')::numeric), 0) AS total_vol
+                    FROM markets m
+                    WHERE m.is_deleted = FALSE
+                      AND m.platform_metadata->>'volume_24h' IS NOT NULL
+                    GROUP BY m.event_id
+                ) sub
+                WHERE e.id = sub.event_id
+                  AND e.is_deleted = FALSE
+            """)
+        logger.info("[kalshi.ingest] Event volume aggregation complete: %s", result)
+    except Exception as exc:
+        logger.error("[kalshi.ingest] Event volume aggregation failed: %s", exc, exc_info=True)
