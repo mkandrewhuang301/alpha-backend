@@ -1,133 +1,249 @@
-import httpx
-import base64
-import time
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import padding
-from app.core.config import KALSHI_API_KEY, KALSHI_PRIVATE_KEY, KALSHI_BASE_URL
+"""
+Kalshi API service — thin wrapper around kalshi-python-async SDK.
+
+The SDK handles RSA-PSS authentication, retries, and pagination internally.
+This module initialises the SDK client once and exposes async helper functions
+matching the signatures that workers and routes already call.
+"""
+
+import json
+import logging
+
+from kalshi_python_async import Configuration, KalshiClient
+from kalshi_python_async.api.market_api import MarketApi
+from kalshi_python_async.api.events_api import EventsApi
+from kalshi_python_async.models import (
+    GetSeriesResponse,
+    GetEventsResponse,
+    GetEventResponse,
+    GetMarketsResponse,
+    GetMarketResponse,
+)
+
+from app.core.config import KALSHI_API_KEY, KALSHI_PRIVATE_KEY, KALSHI_BASE_API_URL
+from app.models.kalshi import KalshiSeriesListResponse
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# SDK client singleton
+# ---------------------------------------------------------------------------
+
+_client: KalshiClient | None = None
 
 
-def _get_auth_headers(method: str, path: str) -> dict:
-    timestamp_ms = str(int(time.time() * 1000))
-    message = timestamp_ms + method.upper() + path
-    private_key = serialization.load_pem_private_key(
-        KALSHI_PRIVATE_KEY.encode(), password=None
-    )
-    signature = private_key.sign(message.encode(), padding.PKCS1v15(), hashes.SHA256())
-    sig_b64 = base64.b64encode(signature).decode()
-    return {
-        "KALSHI-ACCESS-KEY": KALSHI_API_KEY,
-        "KALSHI-ACCESS-TIMESTAMP": timestamp_ms,
-        "KALSHI-ACCESS-SIGNATURE": sig_b64,
-        "Content-Type": "application/json",
-    }
+def _get_client() -> KalshiClient:
+    global _client
+    if _client is None:
+        config = Configuration(host=KALSHI_BASE_API_URL)
+        config.api_key_id = KALSHI_API_KEY
+        config.private_key_pem = KALSHI_PRIVATE_KEY
+        _client = KalshiClient(config)
+    return _client
 
 
-def _handle_response(response: httpx.Response) -> dict:
-    if response.status_code != 200:
-        return {"error": True, "status_code": response.status_code, "detail": response.text}
-    if not response.content:
-        return {"error": True, "status_code": response.status_code, "detail": "Empty response"}
-    return response.json()
+def _get_market_api() -> MarketApi:
+    return MarketApi(_get_client())
 
+def _get_events_api() -> EventsApi:
+    return EventsApi(_get_client())
 
-async def get_markets(status: str = None, series_ticker: str = None, event_ticker: str = None, limit: int = None, cursor: str = None):
-    path = "/trade-api/v2/markets"
-    headers = _get_auth_headers("GET", path)
-    url = f"{KALSHI_BASE_URL}/markets"
-    params = {}
-    if status:
-        params["status"] = status
-    if series_ticker:
-        params["series_ticker"] = series_ticker
-    if event_ticker:
-        params["event_ticker"] = event_ticker
-    if limit:
-        params["limit"] = limit
-    if cursor:
-        params["cursor"] = cursor
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        response = await client.get(url, headers=headers, params=params)
-        return _handle_response(response)
-    
+# ---------------------------------------------------------------------------
+# Series
+# ---------------------------------------------------------------------------
+
 async def get_series_list(
-    category: str = None,
-    tags: str = None,
+    category: str | None = None,
+    tags: str | None = None,
     include_product_metadata: bool = False,
     include_volume: bool = False,
-):
-    path = "/trade-api/v2/series"
-    headers = _get_auth_headers("GET", path)
-    url = f"{KALSHI_BASE_URL}/series"
-    params = {}
-    if category:
-        params["category"] = category
-    if tags:
-        params["tags"] = tags
-    if include_product_metadata:
-        params["include_product_metadata"] = "true"
-    if include_volume:
-        params["include_volume"] = "true"
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        response = await client.get(url, headers=headers, params=params)
-        return _handle_response(response)
+    min_updated_ts: int | None = None,
+) -> KalshiSeriesListResponse:
+    """Fetch all Kalshi series.
+
+    Bypasses the SDK's own deserialization because the SDK's Series model
+    rejects tags=null from the API. We use our KalshiSeries model instead,
+    which handles Optional[List[str]] correctly.
+    """
+    try:
+        market_api = _get_market_api()
+        # Use the SDK's serialization for params + auth, but get raw response
+        _param = market_api._get_series_list_serialize(
+            category=category,
+            tags=tags,
+            include_product_metadata=include_product_metadata,
+            include_volume=include_volume,
+            min_updated_ts=min_updated_ts,
+            _request_auth=None,
+            _content_type=None,
+            _headers=None,
+            _host_index=0,
+        )
+        response_data = await market_api.api_client.call_api(*_param)
+        await response_data.read()
+        raw = json.loads(response_data.data)
+        return KalshiSeriesListResponse(**raw)
+    except Exception as exc:
+        logger.error("[kalshi] Failed to fetch series: %s", exc)
+        raise
 
 
-async def get_series(series_ticker: str, include_volume: bool = False):
-    path = f"/trade-api/v2/series/{series_ticker}"
-    headers = _get_auth_headers("GET", path)
-    url = f"{KALSHI_BASE_URL}/series/{series_ticker}"
-    params = {}
-    if include_volume:
-        params["include_volume"] = "true"
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        response = await client.get(url, headers=headers, params=params)
-        return _handle_response(response)
+async def get_series(
+    series_ticker: str,
+    include_volume: bool = False,
+) -> GetSeriesResponse:
+    """Fetch a single series by ticker."""
+    try:
+        market_api = _get_market_api()
+        resp: GetSeriesResponse = await market_api.get_series(
+            series_ticker=series_ticker,
+            include_volume=include_volume,
+        )
+        return resp
+    except Exception as exc:
+        logger.error("[kalshi] Failed to fetch series %s: %s", series_ticker, exc)
+        raise
 
 
-#get specific market  by ticker
-async def get_market(ticker: str):
-    path = f"/trade-api/v2/markets/{ticker}"
-    headers = _get_auth_headers("GET", path)
-    url = f"{KALSHI_BASE_URL}/markets/{ticker}"
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        response = await client.get(url, headers=headers)
-        return _handle_response(response)
-
+# ---------------------------------------------------------------------------
+# Events
+# ---------------------------------------------------------------------------
 
 async def get_events(
     limit: int = 200,
-    cursor: str = None,
+    cursor: str | None = None,
     with_nested_markets: bool = False,
     with_milestones: bool = False,
-    status: str = None,
-    series_ticker: str = None,
+    status: str | None = None,
+    series_ticker: str | None = None,
+) -> GetEventsResponse:
+    """Fetch paginated events."""
+    try:
+        events_api = _get_events_api()
+        resp: GetEventsResponse = await events_api.get_events(
+            limit=limit,
+            cursor=cursor,
+            with_nested_markets=with_nested_markets,
+            with_milestones=with_milestones,
+            status=status,
+            series_ticker=series_ticker,
+        )
+        return resp
+    except Exception as exc:
+        logger.error("[kalshi] Failed to fetch events: %s", exc)
+        raise
+
+
+async def get_event(
+    event_ticker: str,
+    with_nested_markets: bool = False,
+) -> GetEventResponse:
+    """Fetch a single event by ticker."""
+    try:
+        events_api = _get_events_api()
+        resp: GetEventResponse = await events_api.get_event(
+            event_ticker=event_ticker,
+            with_nested_markets=with_nested_markets,
+        )
+        return resp
+    except Exception as exc:
+        logger.error("[kalshi] Failed to fetch event %s: %s", event_ticker, exc)
+        raise
+
+
+# ---------------------------------------------------------------------------
+# Markets
+# ---------------------------------------------------------------------------
+
+async def get_markets(
+    status: str | None = None,
+    series_ticker: str | None = None,
+    event_ticker: str | None = None,
+    limit: int | None = None,
+    cursor: str | None = None,
+    min_close_ts: int | None = None,
+    min_updated_ts: int | None = None,
+) -> GetMarketsResponse:
+    """Fetch paginated markets."""
+    try:
+        market_api = _get_market_api()
+        resp: GetMarketsResponse = await market_api.get_markets(
+            status=status,
+            series_ticker=series_ticker,
+            event_ticker=event_ticker,
+            limit=limit,
+            cursor=cursor,
+            min_close_ts=min_close_ts,
+            min_updated_ts=min_updated_ts,
+        )
+        return resp
+    except Exception as exc:
+        logger.error("[kalshi] Failed to fetch markets: %s", exc)
+        raise
+
+
+async def get_market(ticker: str) -> GetMarketResponse:
+    """Fetch a single market by ticker."""
+    try:
+        market_api = _get_market_api()
+        resp: GetMarketResponse = await market_api.get_market(ticker=ticker)
+        return resp
+    except Exception as exc:
+        logger.error("[kalshi] Failed to fetch market %s: %s", ticker, exc)
+        raise
+
+
+# ---------------------------------------------------------------------------
+# Candlesticks
+# ---------------------------------------------------------------------------
+
+async def get_market_candlesticks(
+    series_ticker: str,
+    market_ticker: str,
+    start_ts: int,
+    end_ts: int,
+    period_interval: int = 1,
 ):
-    path = "/trade-api/v2/events"
-    headers = _get_auth_headers("GET", path)
-    url = f"{KALSHI_BASE_URL}/events"
-    params = {"limit": limit}
-    if cursor:
-        params["cursor"] = cursor
-    if with_nested_markets:
-        params["with_nested_markets"] = "true"
-    if with_milestones:
-        params["with_milestones"] = "true"
-    if status:
-        params["status"] = status
-    if series_ticker:
-        params["series_ticker"] = series_ticker
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        response = await client.get(url, headers=headers, params=params)
-        return _handle_response(response)
+    """Fetch historical candlesticks for a single market from Kalshi REST API.
+
+    Returns OHLCV data at the specified period_interval (1 = 1-minute candles).
+    Prices in the response are in cents (0-100); normalize before use.
+    """
+    try:
+        market_api = _get_market_api()
+        resp = await market_api.get_market_candlesticks(
+            series_ticker=series_ticker,
+            ticker=market_ticker,
+            start_ts=start_ts,
+            end_ts=end_ts,
+            period_interval=period_interval,
+        )
+        return resp
+    except Exception as exc:
+        logger.error("[kalshi] Failed to fetch candlesticks for %s: %s", market_ticker, exc)
+        raise
 
 
-async def get_event(event_ticker: str, with_nested_markets: bool = False):
-    path = f"/trade-api/v2/events/{event_ticker}"
-    headers = _get_auth_headers("GET", path)
-    url = f"{KALSHI_BASE_URL}/events/{event_ticker}"
-    params = {}
-    if with_nested_markets:
-        params["with_nested_markets"] = "true"
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        response = await client.get(url, headers=headers, params=params)
-        return _handle_response(response)
+async def batch_get_market_candlesticks(
+    market_tickers: list[str],
+    start_ts: int,
+    end_ts: int,
+    period_interval: int = 1,
+):
+    """Batch-fetch historical candlesticks for multiple markets from Kalshi REST API.
+
+    Returns a BatchGetMarketCandlesticksResponse with a `markets` list,
+    each containing `market_ticker` and `candlesticks`.
+    """
+    try:
+        market_api = _get_market_api()
+        resp = await market_api.batch_get_market_candlesticks(
+            market_tickers=market_tickers,
+            start_ts=start_ts,
+            end_ts=end_ts,
+            period_interval=period_interval,
+        )
+        return resp
+    except Exception as exc:
+        logger.error("[kalshi] Failed to batch fetch candlesticks for %s markets: %s", len(market_tickers), exc)
+        raise
