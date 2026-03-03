@@ -22,9 +22,10 @@ from fastapi import FastAPI
 from app.api.routes import events, markets, series
 from app.api.routes.v1 import events as v1_events
 from app.api.routes.v1 import candlesticks as v1_candlesticks
+from app.api.routes.v1 import dev as v1_dev
+from app.core.config import DEV_MODE
 from app.core.database import init_db, init_asyncpg_pool, close_asyncpg_pool
 from app.core.redis import get_redis, close_redis
-from app.workers.kalshi.ingest import run_kalshi_full_sync
 from app.workers.kalshi.stream import run_kalshi_ws
 
 logging.basicConfig(
@@ -51,14 +52,19 @@ async def lifespan(app: FastAPI):
     await get_redis()
     logger.info("Connection pools ready (asyncpg + Redis).")
 
-    # Run an immediate full Kalshi sync on startup so the DB is populated
-    # before the app starts serving requests.
-    logger.info("Running initial Kalshi sync...")
-    await run_kalshi_full_sync()
+    if DEV_MODE:
+        # DEV_MODE: sync only the 3 sandbox series before starting WS.
+        # This populates DEV_TARGET_MARKETS so the WS subscription is correct.
+        logger.info("DEV_MODE=True — running restricted Kalshi sync (3 series)...")
+        from app.workers.kalshi.ingest import run_kalshi_dev_sync
+        await run_kalshi_dev_sync()
+        logger.info("DEV_MODE sync complete.")
+    else:
+        logger.info("PROD MODE — full Kalshi sync skipped on startup (handled by arq cron).")
 
     # Start WebSocket firehose as a background task
     ws_task = asyncio.create_task(run_kalshi_ws())
-    logger.info("Kalshi WebSocket firehose started.")
+    logger.info("Kalshi WebSocket firehose started (mode=%s).", "dev" if DEV_MODE else "prod")
 
     yield
 
@@ -71,8 +77,10 @@ async def lifespan(app: FastAPI):
     except asyncio.CancelledError:
         pass
 
-    await close_redis()
+    # Close connection pools to release Supabase connections cleanly.
+    # Without this, connections leak and accumulate across restarts.
     await close_asyncpg_pool()
+    await close_redis()
     logger.info("Shutdown complete.")
 
 
@@ -88,3 +96,4 @@ app.include_router(events.router, prefix="/events", tags=["events"])
 app.include_router(markets.router, prefix="/markets", tags=["markets"])
 app.include_router(v1_events.router, prefix="/api/v1", tags=["v1-events"])
 app.include_router(v1_candlesticks.router, prefix="/api/v1", tags=["v1-candlesticks"])
+app.include_router(v1_dev.router, prefix="/api/v1", tags=["v1-dev"])

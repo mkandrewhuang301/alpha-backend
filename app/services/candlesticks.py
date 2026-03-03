@@ -103,6 +103,37 @@ async def update_live_candle(
     )
 
 
+async def batch_update_live_candles(
+    redis_conn: aioredis.Redis,
+    updates: list[tuple[str, int, int]],
+) -> None:
+    """
+    Batch-update live candles for multiple markets via a single Redis pipeline.
+
+    Each item in `updates` is (market_ticker, last_price_cents, volume).
+    All EVAL commands are sent in one network round-trip via pipeline.execute().
+    """
+    if not updates:
+        return
+
+    minute_ts = _current_minute_ts()
+    pipe = redis_conn.pipeline(transaction=False)
+
+    for market_ticker, last_price_cents, volume in updates:
+        key = _candle_key(market_ticker, minute_ts)
+        price_bp = int(last_price_cents * 100)
+        pipe.eval(
+            _LUA_UPSERT_CANDLE,
+            1,
+            key,
+            str(price_bp),
+            str(volume),
+            str(CANDLE_TTL_SECONDS),
+        )
+
+    await pipe.execute()
+
+
 async def get_live_candle(
     redis_conn: aioredis.Redis,
     market_ticker: str,
@@ -139,8 +170,8 @@ async def get_live_candle(
 # ---------------------------------------------------------------------------
 
 async def fetch_historical_candlesticks(
-    event_ticker: str,
     series_ticker: str,
+    market_ticker: str,
     start_ts: int,
     end_ts: int,
     period_interval: int = 1,
@@ -155,8 +186,8 @@ async def fetch_historical_candlesticks(
 
     try:
         resp = await get_market_candlesticks(
-            event_ticker=event_ticker,
             series_ticker=series_ticker,
+            market_ticker=market_ticker,
             start_ts=start_ts,
             end_ts=end_ts,
             period_interval=period_interval,
@@ -165,19 +196,37 @@ async def fetch_historical_candlesticks(
         candles: list[dict] = []
         if resp and hasattr(resp, "candlesticks") and resp.candlesticks:
             for c in resp.candlesticks:
+                # Prefer actual trade prices (PriceDistribution.open/high/low/close).
+                # Kalshi sets these to None when no trades occurred in the period.
+                # Fall back to bid/ask midpoint when trade prices are unavailable.
+                price = c.price
+                if price.open is not None:
+                    open_p = price.open / 100.0
+                    high_p = price.high / 100.0
+                    low_p = price.low / 100.0
+                    close_p = price.close / 100.0
+                elif c.yes_bid and c.yes_ask:
+                    # Midpoint of yes bid/ask (cents → 0.0-1.0)
+                    open_p = (c.yes_bid.open + c.yes_ask.open) / 2 / 100.0
+                    high_p = (c.yes_bid.high + c.yes_ask.high) / 2 / 100.0
+                    low_p = (c.yes_bid.low + c.yes_ask.low) / 2 / 100.0
+                    close_p = (c.yes_bid.close + c.yes_ask.close) / 2 / 100.0
+                else:
+                    continue  # skip if no price data at all
+
                 candles.append({
-                    "timestamp": c.end_period_ts if hasattr(c, "end_period_ts") else c.get("end_period_ts", 0),
-                    "open": (c.price.open if hasattr(c, "price") else c.get("open", 0)) / 100.0,
-                    "high": (c.price.high if hasattr(c, "price") else c.get("high", 0)) / 100.0,
-                    "low": (c.price.low if hasattr(c, "price") else c.get("low", 0)) / 100.0,
-                    "close": (c.price.close if hasattr(c, "price") else c.get("close", 0)) / 100.0,
-                    "volume": c.volume if hasattr(c, "volume") else c.get("volume", 0),
+                    "timestamp": c.end_period_ts,
+                    "open": open_p,
+                    "high": high_p,
+                    "low": low_p,
+                    "close": close_p,
+                    "volume": c.volume or 0,
                 })
 
         return candles
 
     except Exception as exc:
-        logger.error("[candlesticks] Failed to fetch historical candles for %s: %s", event_ticker, exc)
+        logger.error("[candlesticks] Failed to fetch historical candles for %s/%s: %s", series_ticker, market_ticker, exc)
         return []
 
 
@@ -197,19 +246,21 @@ async def get_merged_candlesticks(
     Merge historical Kalshi candles with live Redis candle for each market.
 
     Steps:
-    1. Fetch historical candles from Kalshi REST API.
+    1. Fetch historical candles from Kalshi REST API (uses first market_ticker).
     2. Fetch live candle from Redis for the current minute.
     3. If the current minute exists in historical data, overwrite HLCV with Redis data.
        If not, append the Redis candle.
     4. Return unified array sorted by timestamp.
     """
-    # Step 1: Historical from Kalshi
-    historical = await fetch_historical_candlesticks(
-        event_ticker=event_ticker,
-        series_ticker=series_ticker,
-        start_ts=start_ts,
-        end_ts=end_ts,
-    )
+    # Step 1: Historical from Kalshi (use first market_ticker if available)
+    historical: list[dict] = []
+    if market_tickers:
+        historical = await fetch_historical_candlesticks(
+            series_ticker=series_ticker,
+            market_ticker=market_tickers[0],
+            start_ts=start_ts,
+            end_ts=end_ts,
+        )
 
     # Step 2: Live candles from Redis for each market
     live_candles: list[dict] = []

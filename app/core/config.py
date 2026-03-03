@@ -16,3 +16,7 @@ DATABASE_URL = os.getenv("DATABASE_URL", "")
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 
 ENVIRONMENT = os.getenv("ENVIRONMENT", "development")
+
+# Development sandbox mode — restricts ingestion and WebSocket to a small
+# subset of markets to stay within free-tier Redis Cloud ops/sec limits.
+DEV_MODE = os.getenv("DEV_MODE", "false").lower() in ("true", "1", "yes")

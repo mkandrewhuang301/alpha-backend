@@ -133,12 +133,13 @@ async def list_categories(
 async def list_events(
     exchange: str = Path(description="Exchange name"),
     category: Optional[str] = Query(default=None, description="Filter by category"),
+    series_ticker: Optional[str] = Query(default=None, description="Filter by series ticker (e.g. KXHIGHNY)"),
     sort: str = Query(default="volume", description="Sort: 'volume', 'closing_soon', 'newest'"),
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
     db: AsyncSession = Depends(get_db),
 ) -> EventFeedResponse:
-    """Event feed with category filter, sorting, and pagination. Merges lead market yes/no prices from Redis."""
+    """Event feed with category/series filter, sorting, and pagination. Merges lead market yes/no prices from Redis."""
     redis = await get_redis()
     cache = MarketCacheManager(redis)
 
@@ -147,6 +148,7 @@ async def list_events(
         db=db,
         cache=cache,
         category=category,
+        series_ticker=series_ticker,
         sort=sort,
         limit=limit,
         offset=offset,

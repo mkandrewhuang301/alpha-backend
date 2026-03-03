@@ -10,10 +10,10 @@ from uuid import UUID
 
 from sqlalchemy import distinct, select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import selectinload, joinedload
 
 from app.core.market_cache import MarketCacheManager
-from app.models.db import Event, Market
+from app.models.db import Event, Market, Series
 
 
 def _build_redis_asset_id(exchange: str, market_ext_id: str, execution_asset_id: str) -> str:
@@ -50,6 +50,7 @@ async def list_events_feed(
     db: AsyncSession,
     cache: MarketCacheManager,
     category: Optional[str] = None,
+    series_ticker: Optional[str] = None,
     sort: str = "volume",
     limit: int = 50,
     offset: int = 0,
@@ -63,6 +64,12 @@ async def list_events_feed(
 
     if category:
         stmt = stmt.where(Event.category == category)
+
+    if series_ticker:
+        stmt = stmt.join(Series, Event.series_id == Series.id).where(
+            Series.ext_id == series_ticker,
+            Series.is_deleted == False,
+        )
 
     if sort == "closing_soon":
         stmt = stmt.where(Event.status == "active").order_by(Event.close_time.asc().nullslast())

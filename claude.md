@@ -96,10 +96,11 @@ FastAPI Backend (web process)
 └───────────────────────────────────────┘
       ↕ (workers populate DB continuously)
 ┌─────────────────────────────────────┐
-│ Redis                                │
-│  ├── arq job queue (worker process) │
-│  └── market:{ticker} HSET (ticks)   │
-└─────────────────────────────────────┘
+│ Redis                                          │
+│  ├── arq job queue (worker process)           │
+│  ├── ticker:{exchange}:{asset_id} HSET (ticks)│
+│  └── candle:kalshi:{ticker}:{min_ts} HSET     │
+└────────────────────────────────────────────────┘
       ↕
 ┌─────────────────────────────────────┐
 │ External APIs / Data Sources         │
@@ -115,12 +116,35 @@ FastAPI Backend (web process)
 
 **Data flow for market data:**
 ```
-Kalshi WS ──► ticker channel ──► Redis HSET (real-time prices) + Redis candle (live OHLCV)
-Kalshi WS ──► market_lifecycle_v2 ──► PostgreSQL (status/result changes)
-arq cron  ──► kalshi_full_sync (15m) ──► PostgreSQL (full backfill)
-arq cron  ──► state_reconciliation (1m) ──► PostgreSQL (delta sync)
+Kalshi WS ──► ticker channel ──► Redis HSET ticker:{exchange}:{asset_id} + candle:{ticker}:{min} (live OHLCV)
+Kalshi WS ──► market_lifecycle_v2 ──► PostgreSQL UPDATE only (status/result; semaphore(3) for connection safety)
+arq cron  ──► kalshi_full_sync (15m, prod only) ──► PostgreSQL (full series+events+markets+outcomes backfill)
+arq cron  ──► state_reconciliation (1m, prod only) ──► PostgreSQL (delta via min_updated_ts filter)
+arq cron  ──► aggregate_event_volumes (5m, prod only) ──► PostgreSQL (events.volume_24h from market metadata)
+arq cron  ──► aggregate_ohlcv (1m, prod only) ──► PostgreSQL market_ticks (tick snapshots from Redis)
+POST /api/v1/dev/sync-kalshi ──► run_kalshi_dev_sync() ──► PostgreSQL (dev mode manual trigger)
 Kalshi REST ──► historical candlesticks (on-demand per API request)
 PostgreSQL + Redis ──► FastAPI routes ──► iOS app
+```
+
+**DEV_MODE vs Production WebSocket strategy:**
+```
+DEV_MODE=False (production):
+  Subscribe: global firehose (no market_tickers filter)
+  WS receive loop → _enqueue_ticker() → asyncio.Queue(maxsize=100_000) (non-blocking, drops if full)
+  _redis_flusher() → drain in 100ms/500-item batches → pipeline HSET
+  Phase 2: asyncio.create_task(_flush_candles()) → batch candle EVAL (fire-and-forget, dedup per market)
+
+DEV_MODE=True (sandbox — free-tier Redis Cloud ≤100 ops/sec):
+  Subscribe: {"channels": [...], "market_tickers": [...DEV_TARGET_MARKETS]}
+  WS receive loop → _dev_enqueue_ticker() → _latest_ticks[market_id] = update (dict overwrite)
+  _dev_redis_flusher() → await asyncio.sleep(1.5) → snapshot+clear _latest_ticks → pipeline HSET+EVAL
+  Max ~60–90 ops/sec (N markets × 2 HSET + N EVAL per 1.5s — always under 100 ops/sec limit)
+
+Lifecycle events (both modes):
+  market_lifecycle_v2 → asyncio.create_task(_handle_market_lifecycle(msg))
+  _lifecycle_semaphore = asyncio.Semaphore(3) — caps concurrent Supabase connections (free-tier limit)
+  Only UPDATEs (status, result) — never INSERTs (lifecycle msgs lack event_id, which is NOT NULL)
 ```
 
 **Hybrid OHLCV Candlestick Strategy:**
@@ -167,7 +191,8 @@ alpha-backend/
 │   │       ├── events.py            # Event endpoints — queries DB
 │   │       ├── v1/                  # Versioned endpoints (DB + Redis live data)
 │   │       │   ├── events.py        # /api/v1/{exchange}/events — live prices merged
-│   │       │   └── candlesticks.py  # /api/v1/kalshi/events/{ticker}/candlesticks — hybrid OHLCV
+│   │       │   ├── candlesticks.py  # /api/v1/kalshi/events/{ticker}/candlesticks — hybrid OHLCV
+│   │       │   └── dev.py           # /api/v1/dev/sync-kalshi — manual sync (DEV_MODE only, returns 403 in prod)
 │   │       ├── sports.py            # Injuries, lineups, stats, weather, refs (planned)
 │   │       ├── traders.py           # Sharp trader leaderboard, profiles (planned)
 │   │       ├── users.py             # Auth, positions, portfolio (planned)
@@ -195,10 +220,11 @@ alpha-backend/
 │   │   ├── market_monitor.py        # Watches line movement and volume spikes
 │   │   └── whale_monitor.py         # Polymarket large position detection
 │   └── core/
-│       ├── config.py                # Loads all env variables
+│       ├── config.py                # Loads all env variables (including DEV_MODE)
+│       ├── dev_config.py            # DEV_MODE sandbox constants: DEV_TARGET_SERIES, DEV_TARGET_MARKETS
 │       ├── database.py              # SQLAlchemy engine + raw asyncpg pool
 │       ├── redis.py                 # Redis async connection (arq queue + tick cache)
-│       └── arq_worker.py            # arq WorkerSettings + cron job registration
+│       └── arq_worker.py            # arq WorkerSettings + cron job registration (crons disabled in DEV_MODE)
 ├── tests/
 ├── .env                             # Real keys — NEVER commit
 ├── .env.example                     # Template — commit this
@@ -233,6 +259,14 @@ Full SQL schema is in `/schema.sql`. ORM models live in `app/models/db.py`.
 ---
 
 ## Models Directory (`app/models/`)
+
+### `core/market_cache.py` — Redis Key Schema
+- Key format: `ticker:{exchange}:{execution_asset_id}` — e.g. `ticker:kalshi:KXHIGHNY-26MAR04-B52.5-yes`
+- For Kalshi: `execution_asset_id` = `{market_ticker}-{side}` (side is `yes` or `no`)
+- For Polymarket: `execution_asset_id` = ERC-1155 token ID (globally unique, no composite needed)
+- Each key is a Redis HSET with fields: `price`, `bid`, `bid_size`, `ask`, `ask_size`, `volume_24h`, `ts`
+- Live candle keys: `candle:kalshi:{market_ticker}:{minute_ts}` with 5-minute TTL
+- **Important**: prefix is `ticker:` not `market:` — searching `market:*` finds no keys
 
 ### `db.py` — SQLAlchemy ORM
 - One class per database table
@@ -293,8 +327,11 @@ Full SQL schema is in `/schema.sql`. ORM models live in `app/models/db.py`.
 - Workers log at `INFO` level for normal operation, `WARNING` for skipped items, `ERROR` for failures.
 - Workers must not crash the process on errors — wrap the body in `try/except Exception` and log.
 - Ingestion order matters: always sync `series → events → markets → outcomes` in sequence. Markets reference events; events reference series.
-- On FastAPI startup: run a full sync immediately before serving requests. The WebSocket firehose also starts as a background task in the web process.
-- **Write separation:** tick-level price data → Redis HSET. Metadata/OHLCV → PostgreSQL.
+- **Startup behavior**: DEV_MODE=True runs `run_kalshi_dev_sync()` on FastAPI startup before the WS connects. DEV_MODE=False (production) does NOT run any sync on startup — arq handles full sync on its 15min schedule. The WebSocket firehose starts as a background asyncio task in the web process in both modes.
+- **Write separation:** tick-level price data → Redis HSET (`ticker:{exchange}:{asset_id}`). Metadata → PostgreSQL. Live candles → Redis HSET (`candle:kalshi:{ticker}:{min_ts}`, 5-min TTL).
+- **Batch upserts via UNNEST**: ingest.py builds column arrays and uses `conn.execute(INSERT ... SELECT unnest($1::uuid[]), ...)` for bulk upserts in a single round-trip. Falls back to row-by-row on error to isolate bad rows.
+- **MVE filtering**: tickers starting with `KXMVE` are multivariate event (parlay/combo) markets — skipped at ingest to avoid DB bloat. Check `_is_mve(ticker)` in `ingest.py`.
+- **Event volume**: `events.volume_24h` is not set directly from Kalshi — it's aggregated by `aggregate_event_volumes` arq cron from `markets.platform_metadata->>'volume_24h'` summed per event. Runs every 5 minutes in production.
 
 ### Route Conventions
 - Routes are thin: validate input, call a service function, return a typed response. No business logic in route handlers.
@@ -312,10 +349,36 @@ Full SQL schema is in `/schema.sql`. ORM models live in `app/models/db.py`.
 - When adding new endpoints, create or extend a service file for the domain logic, then write a thin route handler that calls it.
 
 ### Candlestick Caching Pattern
-- **Live candle aggregation**: WebSocket ticker handler calls `update_live_candle()` on every tick, which runs an atomic Lua script in Redis to maintain current-minute OHLCV at key `candle:kalshi:{ticker}:{minute_ts}` with 5-min TTL.
-- **Historical candles**: Fetched on-demand from Kalshi REST API via `services/kalshi.py::get_market_candlesticks()`.
+- **Live candle aggregation**: The WebSocket flusher calls `batch_update_live_candles(redis, [(ticker, price_cents, volume), ...])` from `services/candlesticks.py`. This runs an atomic Lua script per market via a single Redis pipeline, maintaining current-minute OHLCV at key `candle:kalshi:{ticker}:{minute_ts}` with 5-min TTL.
+- **Historical candles**: Fetched on-demand from Kalshi REST API via `services/kalshi.py::get_market_candlesticks(series_ticker, market_ticker, start_ts, end_ts, period_interval)`. Note: takes `series_ticker` + `market_ticker`, not `event_ticker`.
 - **Merge**: `services/candlesticks.py::get_merged_candlesticks()` combines both — overwrites the current minute if it exists in historical data, or appends if not.
-- Prices stored in Redis as integer basis points (0-10000) for Lua integer math; normalized to 0.0-1.0 floats on read.
+- Prices stored in Redis as integer basis points (0–10000) for Lua integer math; normalized to 0.0–1.0 floats on read.
+- **Kalshi 5000-candle limit**: `get_market_candlesticks` returns HTTP 400 if the requested range contains more than 5000 candles (~83 hours at 1-min interval). The service returns `[]` gracefully on error.
+- **None price fallback**: Kalshi `price.open/high/low/close` fields are `None` when no actual trades occurred in a period. Fall back to `(yes_bid.open + yes_ask.open) / 2` midpoint. Never skip periods — fall through to the bid/ask midpoint check.
+- **market_ticker is required for live candle**: The candlestick endpoint accepts optional `market_ticker` query param. Without it, `market_tickers=[]` and the live Redis candle is not fetched — only historical data is returned.
+
+### DEV_MODE — Free-Tier Infrastructure Sandbox
+
+**When DEV_MODE=True:**
+- **Scope**: Only 3 series tracked: `KXHIGHNY` (Weather), `KXCPI` (Economics), `KXNBAPLAYOFF` (Sports)
+- **Dev config**: `app/core/dev_config.py` defines `DEV_TARGET_SERIES` (static list) and `DEV_TARGET_MARKETS` (mutable list, `.clear()` + `.extend()` at startup)
+- **Startup flow**: `run_kalshi_dev_sync()` runs before WS connects → syncs 3 series → fetches `status="open"` events only (fast: ~10s) → builds `DEV_TARGET_MARKETS` list → WS subscribes to those markets only
+- **WebSocket**: `_dev_enqueue_ticker()` writes to `_latest_ticks` dict (overwrites, no queue needed); `_dev_redis_flusher()` sleeps 1.5s then snapshots/clears dict and flushes via single pipeline — guarantees ≤60 Redis ops/sec
+- **Subscribe message**: `{"id": 1, "cmd": "subscribe", "params": {"channels": ["ticker", "market_lifecycle_v2"], "market_tickers": [...DEV_TARGET_MARKETS]}}`
+- **arq crons**: All cron jobs disabled (`WorkerSettings.cron_jobs = []`) — manually trigger via `POST /api/v1/dev/sync-kalshi`
+- **Dev endpoint**: `app/api/routes/v1/dev.py::POST /api/v1/dev/sync-kalshi` — calls `run_kalshi_dev_sync()`, returns `{"status": "ok", "target_markets_count": N}`, returns 403 if DEV_MODE=False
+- **Redis ops budget**: pipeline commands count individually toward limit. Never use `asyncio.gather` for concurrent EVAL calls — causes "max number of clients reached" on Redis Cloud. Always pipeline.
+
+**When DEV_MODE=False (production):**
+- Global firehose subscription (no `market_tickers` filter)
+- Production micro-batching: asyncio.Queue + 100ms/500-item flusher
+- All arq crons enabled
+- `POST /api/v1/dev/sync-kalshi` returns HTTP 403
+
+**Critical for free-tier Redis Cloud:**
+- Pipeline commands are each counted separately toward ops/sec limit
+- `asyncio.gather` for concurrent EVAL calls causes "max number of clients reached" — always use pipeline instead
+- In dev mode, even a single missed debounce cycle is safe because the flusher resets every 1.5s
 
 ---
 
@@ -390,6 +453,7 @@ FIREBASE_CREDENTIALS_PATH=
 
 # App
 ENVIRONMENT=development
+DEV_MODE=false  # Set to true for local/free-tier development (restricts ingestion + WS to 3 series)
 ```
 
 ---
@@ -400,6 +464,7 @@ ENVIRONMENT=development
 2. ✅ Market data ingestion — series/events/markets syncing into PostgreSQL via background worker
 3. ✅ Routes serve from DB — all market endpoints query PostgreSQL
 3b. ✅ Hybrid OHLCV candlestick endpoint — Kalshi historical + Redis live candle merge
+3c. ✅ DEV_MODE sandbox — restricted 3-series sync, memory-debounced WebSocket, manual sync endpoint
 4. Supabase user model — basic auth, user table
 5. Sports data pipeline — Rotowire injury feed flowing
 6. Background worker — injury detection running every 5 minutes

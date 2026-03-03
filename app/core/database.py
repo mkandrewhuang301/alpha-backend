@@ -1,18 +1,31 @@
+import logging
+
 import asyncpg
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 from sqlalchemy.orm import DeclarativeBase
-from app.core.config import DATABASE_URL
+from app.core.config import DATABASE_URL, DEV_MODE
+
+
+logger = logging.getLogger(__name__)
 
 
 class Base(DeclarativeBase):
     pass
 
 
+# DEV_MODE uses smaller pools to stay within Supabase free-tier session
+# pooler connection limits (MaxClientsInSessionMode). With proper shutdown
+# (close_asyncpg_pool on lifespan exit), connections are cleaned up on restart.
+_SA_POOL_SIZE = 3 if DEV_MODE else 10
+_SA_MAX_OVERFLOW = 5 if DEV_MODE else 20
+_ASYNCPG_MIN_SIZE = 2 if DEV_MODE else 5
+_ASYNCPG_MAX_SIZE = 8 if DEV_MODE else 20
+
 engine = create_async_engine(
     DATABASE_URL,
     pool_pre_ping=True,
-    pool_size=10,
-    max_overflow=20,
+    pool_size=_SA_POOL_SIZE,
+    max_overflow=_SA_MAX_OVERFLOW,
     echo=False,
     connect_args={
         "statement_cache_size": 0,
@@ -28,11 +41,20 @@ async_session_factory = async_sessionmaker(
 
 async def init_db() -> None:
     """Create all tables and enum types if they don't already exist."""
-    # Import models so they register with Base.metadata
-    import app.models.db  # noqa: F401
+    logger.info("init_db: starting database initialization")
+    try:
+        # Import models so they register with Base.metadata
+        logger.debug("init_db: importing ORM models")
+        import app.models.db  # noqa: F401
 
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+        logger.debug("init_db: opening engine connection and creating metadata")
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+
+        logger.info("init_db: database initialization completed successfully")
+    except Exception as exc:
+        logger.exception("init_db: database initialization failed", exc_info=exc)
+        raise
 
 
 async def get_db() -> AsyncSession:
@@ -68,8 +90,8 @@ async def init_asyncpg_pool() -> asyncpg.Pool:
     if _asyncpg_pool is None:
         _asyncpg_pool = await asyncpg.create_pool(
             _raw_dsn(),
-            min_size=5,
-            max_size=20,
+            min_size=_ASYNCPG_MIN_SIZE,
+            max_size=_ASYNCPG_MAX_SIZE,
         )
     return _asyncpg_pool
 

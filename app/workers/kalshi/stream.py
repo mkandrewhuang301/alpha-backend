@@ -2,8 +2,23 @@
 Kalshi WebSocket Firehose
 
 Persistent async WebSocket client that subscribes to:
+    - ticker: real-time price/volume updates → batched HSET to Redis via pipeline
     - market_lifecycle_v2: market status changes, new markets, settlements → upsert to Postgres
-    - ticker: real-time price/volume updates → HSET to Redis
+
+Architecture — two modes controlled by DEV_MODE env var:
+
+PRODUCTION MODE (DEV_MODE=False):
+    Micro-batching to prevent event loop starvation:
+    1. WebSocket receive loop: parse JSON, put ticker data into asyncio.Queue (non-blocking)
+    2. Background flusher task: drain queue in 100ms or 500-item batches, flush via Redis pipeline
+    3. market_lifecycle_v2 messages: dispatched as individual asyncio.Tasks (low-frequency)
+
+DEVELOPMENT MODE (DEV_MODE=True):
+    Scope reduction + memory debouncing for free-tier Redis Cloud (100 ops/sec limit):
+    1. Subscribe only to DEV_TARGET_MARKETS (3 series → ~30 open markets)
+    2. WebSocket receive loop: overwrite in-memory dict (latest_ticks[market_id] = data)
+    3. Background flusher: wakes every 1.5s, flushes latest_ticks dict via single pipeline
+    This guarantees ≤ ~60 Redis ops/sec regardless of how fast Kalshi sends updates.
 
 Runs as a long-lived asyncio task started in FastAPI lifespan.
 Reconnects with exponential backoff on disconnect.
@@ -14,38 +29,99 @@ import base64
 import json
 import logging
 import time
-import uuid
 from datetime import datetime, timezone
+from typing import NamedTuple
 
 import websockets
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
-from app.core.config import KALSHI_API_KEY, KALSHI_PRIVATE_KEY, KALSHI_WS_URL
+from app.core.config import KALSHI_API_KEY, KALSHI_PRIVATE_KEY, KALSHI_WS_URL, DEV_MODE
 from app.core.database import async_session_factory
-from app.core.market_cache import MarketCacheManager, _normalize_cents
+from app.core.market_cache import _make_key, _normalize_cents
 from app.core.redis import get_redis
 from app.models.db import Market
 from app.models.kalshi import map_kalshi_status
-from app.services.candlesticks import update_live_candle
+from app.services.candlesticks import batch_update_live_candles
 
 logger = logging.getLogger(__name__)
 
 MAX_BACKOFF = 60
 INITIAL_BACKOFF = 1
 
+# Production micro-batching parameters
+FLUSH_INTERVAL = 0.1   # 100ms
+BATCH_SIZE = 500        # max items per flush
+QUEUE_MAX_SIZE = 100_000
+
+# Dev debounce parameters
+DEV_FLUSH_INTERVAL = 1.5  # seconds between Redis writes in dev mode
+
+
+# ---------------------------------------------------------------------------
+# Ticker update tuple (pre-parsed, ready for Redis writes)
+# ---------------------------------------------------------------------------
+
+class TickerUpdate(NamedTuple):
+    market_ticker: str
+    yes_key: str
+    no_key: str
+    yes_data: dict
+    no_data: dict
+    last_price_cents: int
+    volume: int
+
+
+# ---------------------------------------------------------------------------
+# Shared asyncio.Queue — production mode only
+# ---------------------------------------------------------------------------
+
+_ticker_queue: asyncio.Queue | None = None
+
+
+def _get_ticker_queue() -> asyncio.Queue:
+    global _ticker_queue
+    if _ticker_queue is None:
+        _ticker_queue = asyncio.Queue(maxsize=QUEUE_MAX_SIZE)
+    return _ticker_queue
+
+
+# ---------------------------------------------------------------------------
+# In-memory dict for DEV_MODE debouncing
+# ---------------------------------------------------------------------------
+
+# Latest tick per market — the flusher drains this every 1.5s.
+# Only the last update per market is kept (deduplication).
+_latest_ticks: dict[str, TickerUpdate] = {}
+
+
+# ---------------------------------------------------------------------------
+# RSA-PSS auth headers for WebSocket handshake
+# ---------------------------------------------------------------------------
 
 def _ws_auth_headers() -> dict[str, str]:
-    """Generate RSA-PSS auth headers for the WebSocket handshake."""
+    """Generate RSA-PSS auth headers for the WebSocket handshake.
+
+    Uses PSS padding with MGF1(SHA-256) and DIGEST_LENGTH salt — matches
+    the SDK's KalshiAuth.create_auth_headers() implementation exactly.
+    IMPORTANT: Must use PSS, NOT PKCS1v15. PKCS1v15 returns HTTP 401.
+    """
     timestamp_ms = str(int(time.time() * 1000))
     path = "/trade-api/ws/v2"
-    message = timestamp_ms + "GET" + path
+    message = (timestamp_ms + "GET" + path).encode("utf-8")
 
     private_key = serialization.load_pem_private_key(
         KALSHI_PRIVATE_KEY.encode(), password=None
     )
-    signature = private_key.sign(message.encode(), padding.PKCS1v15(), hashes.SHA256())
-    sig_b64 = base64.b64encode(signature).decode()
+    signature = private_key.sign(
+        message,
+        padding.PSS(
+            mgf=padding.MGF1(hashes.SHA256()),
+            salt_length=padding.PSS.DIGEST_LENGTH,
+        ),
+        hashes.SHA256(),
+    )
+    sig_b64 = base64.b64encode(signature).decode("utf-8")
 
     return {
         "KALSHI-ACCESS-KEY": KALSHI_API_KEY,
@@ -54,154 +130,382 @@ def _ws_auth_headers() -> dict[str, str]:
     }
 
 
-async def _handle_ticker(msg: dict, cache: MarketCacheManager, redis_conn) -> None:
-    """Write per-outcome ticker updates to Redis via MarketCacheManager + live candle."""
+# ---------------------------------------------------------------------------
+# Ticker parser (shared between prod and dev)
+# ---------------------------------------------------------------------------
+
+def _parse_ticker(msg: dict) -> TickerUpdate | None:
+    """
+    Parse a ticker WebSocket message into a TickerUpdate.
+
+    Returns None if the message has no market_ticker.
+    Intentionally synchronous and non-blocking.
+    """
+    data = msg.get("msg", {})
+    ticker = data.get("market_ticker")
+    if not ticker:
+        return None
+
+    ts = str(int(time.time()))
+    last_price = data.get("last_price", 0) or 0
+    volume_raw = data.get("volume", 0) or 0
+    volume_str = str(volume_raw)
+
+    yes_data = {
+        "price": _normalize_cents(last_price),
+        "bid": _normalize_cents(data.get("yes_bid", 0)),
+        "bid_size": str(data.get("yes_bid_size", 0)),
+        "ask": _normalize_cents(data.get("yes_ask", 0)),
+        "ask_size": str(data.get("yes_ask_size", 0)),
+        "volume_24h": volume_str,
+        "ts": ts,
+    }
+
+    no_data = {
+        "price": _normalize_cents(100 - int(last_price)),
+        "bid": _normalize_cents(data.get("no_bid", 0)),
+        "bid_size": str(data.get("no_bid_size", 0)),
+        "ask": _normalize_cents(data.get("no_ask", 0)),
+        "ask_size": str(data.get("no_ask_size", 0)),
+        "volume_24h": volume_str,
+        "ts": ts,
+    }
+
+    return TickerUpdate(
+        market_ticker=ticker,
+        yes_key=_make_key("kalshi", f"{ticker}-yes"),
+        no_key=_make_key("kalshi", f"{ticker}-no"),
+        yes_data=yes_data,
+        no_data=no_data,
+        last_price_cents=int(last_price),
+        volume=int(volume_raw),
+    )
+
+
+# ---------------------------------------------------------------------------
+# PRODUCTION MODE: Non-blocking ticker enqueue + background flusher
+# ---------------------------------------------------------------------------
+
+def _enqueue_ticker(msg: dict) -> None:
+    """
+    Parse a ticker message and enqueue for batch Redis write (production mode).
+
+    Synchronous and non-blocking — returns in microseconds.
+    The WS receive loop is never stalled.
+    """
+    update = _parse_ticker(msg)
+    if update is None:
+        return
     try:
-        data = msg.get("msg", {})
-        ticker = data.get("market_ticker")
-        if not ticker:
-            return
+        _get_ticker_queue().put_nowait(update)
+    except asyncio.QueueFull:
+        logger.warning("[kalshi.stream] Ticker queue full, dropping update for %s", update.market_ticker)
 
-        ts = str(int(time.time()))
-        last_price = data.get("last_price", 0) or 0
-        volume_raw = data.get("volume", 0) or 0
-        volume = str(volume_raw)
 
-        # Yes side
-        await cache.update_ticker("kalshi", f"{ticker}-yes", {
-            "price": _normalize_cents(last_price),
-            "bid": _normalize_cents(data.get("yes_bid", 0)),
-            "bid_size": str(data.get("yes_bid_size", 0)),
-            "ask": _normalize_cents(data.get("yes_ask", 0)),
-            "ask_size": str(data.get("yes_ask_size", 0)),
-            "volume_24h": volume,
-            "ts": ts,
-        })
-
-        # No side
-        await cache.update_ticker("kalshi", f"{ticker}-no", {
-            "price": _normalize_cents(100 - int(last_price)),
-            "bid": _normalize_cents(data.get("no_bid", 0)),
-            "bid_size": str(data.get("no_bid_size", 0)),
-            "ask": _normalize_cents(data.get("no_ask", 0)),
-            "ask_size": str(data.get("no_ask_size", 0)),
-            "volume_24h": volume,
-            "ts": ts,
-        })
-
-        # Live candle aggregation: update current-minute OHLCV in Redis
-        await update_live_candle(
-            redis_conn=redis_conn,
-            market_ticker=ticker,
-            last_price_cents=int(last_price),
-            volume=int(volume_raw),
+async def _flush_candles(redis_conn, updates: list[TickerUpdate]) -> None:
+    """
+    Fire-and-forget: batch-update live candles via a single Redis pipeline.
+    All EVAL commands sent in one round-trip.
+    """
+    try:
+        await batch_update_live_candles(
+            redis_conn,
+            [(u.market_ticker, u.last_price_cents, u.volume) for u in updates],
         )
     except Exception as exc:
-        logger.error("[kalshi.stream] Error handling ticker: %s", exc)
+        logger.error("[kalshi.stream] Candle batch update error: %s", exc)
+
+
+async def _redis_flusher(redis_conn) -> None:
+    """
+    Production background task: drain the ticker queue and flush to Redis via pipeline.
+
+    Two-phase per cycle:
+      1. FAST — batch HSET for all yes/no ticker data via a single pipeline.execute().
+      2. BACKGROUND — candle Lua eval updates fired as a non-blocking asyncio.Task.
+
+    Reduces Redis round-trips from O(ticks/sec) to ~10/sec.
+    """
+    queue = _get_ticker_queue()
+
+    while True:
+        try:
+            batch: list[TickerUpdate] = []
+
+            try:
+                first = await asyncio.wait_for(queue.get(), timeout=FLUSH_INTERVAL)
+                batch.append(first)
+            except asyncio.TimeoutError:
+                await asyncio.sleep(0)
+                continue
+
+            while len(batch) < BATCH_SIZE:
+                try:
+                    batch.append(queue.get_nowait())
+                except asyncio.QueueEmpty:
+                    break
+
+            # Phase 1: fast pipeline HSET for all yes/no ticker data
+            pipe = redis_conn.pipeline(transaction=False)
+            for update in batch:
+                pipe.hset(update.yes_key, mapping=update.yes_data)
+                pipe.hset(update.no_key, mapping=update.no_data)
+            await pipe.execute()
+
+            # Phase 2: fire candle updates as a background task (non-blocking)
+            seen: dict[str, TickerUpdate] = {}
+            for update in batch:
+                seen[update.market_ticker] = update  # last write per market wins
+            asyncio.create_task(_flush_candles(redis_conn, list(seen.values())))
+
+            logger.debug(
+                "[kalshi.stream] Flushed %d ticker updates (%d unique markets)",
+                len(batch),
+                len(seen),
+            )
+
+        except asyncio.CancelledError:
+            logger.info("[kalshi.stream] Flusher task cancelled.")
+            return
+        except Exception as exc:
+            logger.error("[kalshi.stream] Flusher error: %s", exc)
+            await asyncio.sleep(0.1)
+
+
+# ---------------------------------------------------------------------------
+# DEVELOPMENT MODE: In-memory debounce + 1.5s periodic flusher
+# ---------------------------------------------------------------------------
+
+def _dev_enqueue_ticker(msg: dict) -> None:
+    """
+    DEV_MODE ticker handler: overwrite latest_ticks dict (non-blocking).
+
+    Even if the same market fires 50 updates per second, only the most
+    recent snapshot is kept. The background flusher writes it once per 1.5s.
+    """
+    update = _parse_ticker(msg)
+    if update is None:
+        return
+    _latest_ticks[update.market_ticker] = update
+
+
+async def _dev_redis_flusher(redis_conn) -> None:
+    """
+    DEV_MODE background task: flush latest_ticks to Redis every 1.5 seconds.
+
+    Operations per flush cycle (worst case, 30 markets):
+        - 30 markets × 2 HSET (yes + no) = 60 ops
+        - 30 markets × 1 EVAL (candle Lua) = 30 ops  (pipelined)
+        Total: ~90 ops per 1.5s ≈ 60 ops/sec — safely under 100 ops/sec limit.
+
+    The pipeline batches ALL commands into a single network round-trip,
+    so Redis Cloud counts each command individually but they all arrive together.
+    """
+    while True:
+        try:
+            await asyncio.sleep(DEV_FLUSH_INTERVAL)
+
+            if not _latest_ticks:
+                continue
+
+            # Snapshot and clear atomically (asyncio is single-threaded)
+            snapshot = dict(_latest_ticks)
+            _latest_ticks.clear()
+
+            updates = list(snapshot.values())
+
+            # Batch HSET for all yes/no ticker data
+            pipe = redis_conn.pipeline(transaction=False)
+            for update in updates:
+                pipe.hset(update.yes_key, mapping=update.yes_data)
+                pipe.hset(update.no_key, mapping=update.no_data)
+            await pipe.execute()
+
+            # Batch candle EVAL via pipeline (one pipeline round-trip)
+            candle_updates = [(u.market_ticker, u.last_price_cents, u.volume) for u in updates]
+            await batch_update_live_candles(redis_conn, candle_updates)
+
+            logger.debug("[kalshi.stream] DEV flush: %d unique markets → Redis", len(updates))
+
+        except asyncio.CancelledError:
+            logger.info("[kalshi.stream] DEV flusher task cancelled.")
+            return
+        except Exception as exc:
+            logger.error("[kalshi.stream] DEV flusher error: %s", exc)
+            await asyncio.sleep(0.5)
+
+
+# ---------------------------------------------------------------------------
+# Market lifecycle handler (Postgres UPDATE only)
+# ---------------------------------------------------------------------------
+
+# Semaphore limits concurrent DB connections from lifecycle events.
+# On Supabase free-tier the pooler has a hard client limit — without this,
+# a burst of lifecycle events on WS connect saturates the connection pool.
+_lifecycle_semaphore: asyncio.Semaphore | None = None
+
+
+def _get_lifecycle_semaphore() -> asyncio.Semaphore:
+    global _lifecycle_semaphore
+    if _lifecycle_semaphore is None:
+        # Allow 3 concurrent lifecycle DB writes — safe for free-tier Supabase
+        _lifecycle_semaphore = asyncio.Semaphore(3)
+    return _lifecycle_semaphore
 
 
 async def _handle_market_lifecycle(msg: dict) -> None:
-    """Handle market lifecycle event — upsert status/result changes to Postgres."""
-    try:
-        from sqlalchemy.dialects.postgresql import insert as pg_insert
+    """Handle market lifecycle event — UPDATE status/result for existing markets in Postgres.
 
-        data = msg.get("msg", {})
-        ticker = data.get("market_ticker")
-        if not ticker:
-            return
+    We intentionally skip INSERT here because lifecycle events don't include event_id,
+    and the markets table has event_id NOT NULL. Full market creation happens via the
+    ingest worker (run_kalshi_dev_sync or run_kalshi_full_sync). This handler only
+    patches status + result for markets that already exist in the DB.
+    """
+    async with _get_lifecycle_semaphore():
+        try:
+            from sqlalchemy import update as sa_update
 
-        status = map_kalshi_status(data.get("status"))
-        result = data.get("result")
+            data = msg.get("msg", {})
+            ticker = data.get("market_ticker")
+            if not ticker:
+                return
 
-        async with async_session_factory() as session:
-            stmt = (
-                pg_insert(Market)
-                .values(
-                    id=uuid.uuid4(),
-                    event_id=None,  # lifecycle events may not include event_id
-                    exchange="kalshi",
-                    ext_id=ticker,
-                    title=data.get("title", ticker),
-                    status=status,
-                    result=result,
-                    is_deleted=False,
+            status = map_kalshi_status(data.get("status"))
+            result = data.get("result")
+
+            update_fields: dict = {"updated_at": datetime.now(timezone.utc)}
+            if status:
+                update_fields["status"] = status
+            if result is not None:
+                update_fields["result"] = result
+
+            async with async_session_factory() as session:
+                stmt = (
+                    sa_update(Market)
+                    .where(Market.ext_id == ticker, Market.exchange == "kalshi")
+                    .values(**update_fields)
                 )
-                .on_conflict_do_update(
-                    constraint="uq_markets_exchange_extid",
-                    set_={
-                        "status": status,
-                        "result": result,
-                        "updated_at": datetime.now(timezone.utc),
-                    },
-                )
-            )
-            await session.execute(stmt)
-            await session.commit()
+                result_proxy = await session.execute(stmt)
+                await session.commit()
 
-        logger.info("[kalshi.stream] Market lifecycle: %s → %s", ticker, status)
-    except Exception as exc:
-        logger.error("[kalshi.stream] Error handling lifecycle: %s", exc)
+                if result_proxy.rowcount > 0:
+                    logger.info("[kalshi.stream] Market lifecycle: %s → %s", ticker, status)
+                else:
+                    logger.debug(
+                        "[kalshi.stream] Market lifecycle: %s not in DB yet (will be synced by ingest worker)",
+                        ticker,
+                    )
+        except Exception as exc:
+            logger.error("[kalshi.stream] Error handling lifecycle: %s", exc)
 
 
-async def _dispatch_message(raw: str, cache: MarketCacheManager, redis_conn) -> None:
-    """Route an incoming WebSocket message to the appropriate handler."""
-    try:
-        msg = json.loads(raw)
-    except json.JSONDecodeError:
-        logger.warning("[kalshi.stream] Non-JSON message: %s", raw[:200])
-        return
-
-    msg_type = msg.get("type")
-    if msg_type == "ticker":
-        await _handle_ticker(msg, cache, redis_conn)
-    elif msg_type == "market_lifecycle_v2":
-        await _handle_market_lifecycle(msg)
-
+# ---------------------------------------------------------------------------
+# Main WebSocket loop
+# ---------------------------------------------------------------------------
 
 async def run_kalshi_ws() -> None:
     """
     Main WebSocket loop with exponential backoff reconnection.
     Intended to be run as an asyncio.create_task() from FastAPI lifespan.
+
+    Selects the appropriate flusher and subscription strategy based on DEV_MODE:
+    - DEV_MODE=False (production): global firehose + asyncio.Queue micro-batching
+    - DEV_MODE=True  (dev):        filtered subscription (DEV_TARGET_MARKETS) + 1.5s debounce
     """
     backoff = INITIAL_BACKOFF
 
-    # Create cache manager once for the lifetime of the WS connection
-    redis = await get_redis()
-    cache = MarketCacheManager(redis)
-    redis_conn = redis  # same connection for live candle aggregation
+    redis_conn = await get_redis()
 
-    while True:
+    # Choose flusher based on mode
+    if DEV_MODE:
+        flusher_coro = _dev_redis_flusher(redis_conn)
+        logger.info("[kalshi.stream] DEV_MODE: using memory-debounced flusher (1.5s interval)")
+    else:
+        flusher_coro = _redis_flusher(redis_conn)
+        logger.info("[kalshi.stream] PROD MODE: using micro-batching flusher (100ms interval)")
+
+    flusher_task = asyncio.create_task(flusher_coro)
+
+    try:
+        while True:
+            try:
+                headers = _ws_auth_headers()
+                logger.info("[kalshi.stream] Connecting to %s ...", KALSHI_WS_URL)
+
+                async with websockets.connect(
+                    KALSHI_WS_URL,
+                    additional_headers=headers,
+                    ping_interval=20,
+                    ping_timeout=10,
+                ) as ws:
+                    logger.info("[kalshi.stream] Connected.")
+                    backoff = INITIAL_BACKOFF  # reset on successful connect
+
+                    # Build subscribe params based on mode
+                    if DEV_MODE:
+                        from app.core.dev_config import DEV_TARGET_MARKETS
+                        subscribe_params: dict = {
+                            "channels": ["ticker", "market_lifecycle_v2"],
+                        }
+                        if DEV_TARGET_MARKETS:
+                            subscribe_params["market_tickers"] = list(DEV_TARGET_MARKETS)
+                            logger.info(
+                                "[kalshi.stream] DEV: Subscribing to %d markets across 3 series",
+                                len(DEV_TARGET_MARKETS),
+                            )
+                        else:
+                            logger.warning(
+                                "[kalshi.stream] DEV: DEV_TARGET_MARKETS is empty — "
+                                "subscribing without market filter (run dev sync first)"
+                            )
+                    else:
+                        subscribe_params = {
+                            "channels": ["ticker", "market_lifecycle_v2"],
+                        }
+
+                    subscribe_msg = json.dumps({
+                        "id": 1,
+                        "cmd": "subscribe",
+                        "params": subscribe_params,
+                    })
+                    await ws.send(subscribe_msg)
+                    logger.info("[kalshi.stream] Subscribed (mode=%s)", "dev" if DEV_MODE else "prod")
+
+                    async for raw_msg in ws:
+                        try:
+                            msg = json.loads(raw_msg)
+                        except json.JSONDecodeError:
+                            logger.warning("[kalshi.stream] Non-JSON message: %s", raw_msg[:200])
+                            continue
+
+                        msg_type = msg.get("type")
+
+                        if msg_type == "ticker":
+                            if DEV_MODE:
+                                _dev_enqueue_ticker(msg)
+                            else:
+                                _enqueue_ticker(msg)
+                        elif msg_type == "market_lifecycle_v2":
+                            asyncio.create_task(_handle_market_lifecycle(msg))
+                        else:
+                            logger.debug("[kalshi.stream] Unhandled message type: %s", msg_type)
+
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.error(
+                    "[kalshi.stream] Connection error: %s — reconnecting in %ds",
+                    exc,
+                    backoff,
+                )
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, MAX_BACKOFF)
+
+    except asyncio.CancelledError:
+        logger.info("[kalshi.stream] WS task cancelled, shutting down.")
+        flusher_task.cancel()
         try:
-            headers = _ws_auth_headers()
-            logger.info("[kalshi.stream] Connecting to %s ...", KALSHI_WS_URL)
-
-            async with websockets.connect(
-                KALSHI_WS_URL,
-                additional_headers=headers,
-                ping_interval=20,
-                ping_timeout=10,
-            ) as ws:
-                logger.info("[kalshi.stream] Connected.")
-                backoff = INITIAL_BACKOFF  # reset on successful connect
-
-                # Subscribe to channels
-                subscribe_msg = json.dumps({
-                    "id": 1,
-                    "cmd": "subscribe",
-                    "params": {
-                        "channels": ["ticker", "market_lifecycle_v2"],
-                    },
-                })
-                await ws.send(subscribe_msg)
-                logger.info("[kalshi.stream] Subscribed to ticker + market_lifecycle_v2")
-
-                async for raw_msg in ws:
-                    await _dispatch_message(raw_msg, cache, redis_conn)
-
+            await flusher_task
         except asyncio.CancelledError:
-            logger.info("[kalshi.stream] Task cancelled, shutting down.")
-            return
-        except Exception as exc:
-            logger.error("[kalshi.stream] Connection error: %s — reconnecting in %ds", exc, backoff)
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, MAX_BACKOFF)
+            pass
+        return

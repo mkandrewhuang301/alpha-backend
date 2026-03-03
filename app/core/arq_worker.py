@@ -15,7 +15,7 @@ import logging
 from arq import cron
 from arq.connections import RedisSettings
 
-from app.core.config import REDIS_URL
+from app.core.config import REDIS_URL, DEV_MODE
 
 logger = logging.getLogger(__name__)
 
@@ -91,7 +91,8 @@ class WorkerSettings:
         run_aggregate_ohlcv,
         run_aggregate_event_volumes,
     ]
-    cron_jobs = [
+    # In DEV_MODE all crons are disabled — use POST /api/v1/dev/sync-kalshi instead.
+    cron_jobs = [] if DEV_MODE else [
         cron(run_kalshi_full_sync, minute={0, 15, 30, 45}),
         cron(run_kalshi_state_reconciliation, minute=set(range(60)), unique=True),
         cron(run_aggregate_ohlcv, minute=set(range(60)), unique=True),

@@ -198,27 +198,52 @@ async def get_market(ticker: str) -> GetMarketResponse:
 # ---------------------------------------------------------------------------
 
 async def get_market_candlesticks(
-    event_ticker: str,
     series_ticker: str,
+    market_ticker: str,
     start_ts: int,
     end_ts: int,
     period_interval: int = 1,
 ):
-    """Fetch historical candlesticks from Kalshi REST API.
+    """Fetch historical candlesticks for a single market from Kalshi REST API.
 
-    Uses get_market_candlesticks_by_event which returns OHLCV data
-    at the specified period_interval (1 = 1-minute candles).
+    Returns OHLCV data at the specified period_interval (1 = 1-minute candles).
+    Prices in the response are in cents (0-100); normalize before use.
     """
     try:
         market_api = _get_market_api()
-        resp = await market_api.get_market_candlesticks_by_event(
-            ticker=event_ticker,
+        resp = await market_api.get_market_candlesticks(
             series_ticker=series_ticker,
+            ticker=market_ticker,
             start_ts=start_ts,
             end_ts=end_ts,
             period_interval=period_interval,
         )
         return resp
     except Exception as exc:
-        logger.error("[kalshi] Failed to fetch candlesticks for %s: %s", event_ticker, exc)
+        logger.error("[kalshi] Failed to fetch candlesticks for %s: %s", market_ticker, exc)
+        raise
+
+
+async def batch_get_market_candlesticks(
+    market_tickers: list[str],
+    start_ts: int,
+    end_ts: int,
+    period_interval: int = 1,
+):
+    """Batch-fetch historical candlesticks for multiple markets from Kalshi REST API.
+
+    Returns a BatchGetMarketCandlesticksResponse with a `markets` list,
+    each containing `market_ticker` and `candlesticks`.
+    """
+    try:
+        market_api = _get_market_api()
+        resp = await market_api.batch_get_market_candlesticks(
+            market_tickers=market_tickers,
+            start_ts=start_ts,
+            end_ts=end_ts,
+            period_interval=period_interval,
+        )
+        return resp
+    except Exception as exc:
+        logger.error("[kalshi] Failed to batch fetch candlesticks for %s markets: %s", len(market_tickers), exc)
         raise

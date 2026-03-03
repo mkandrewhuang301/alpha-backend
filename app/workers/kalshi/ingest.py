@@ -28,6 +28,7 @@ from app.models.kalshi import (
 from app.services.kalshi import (
     get_events,
     get_markets,
+    get_series,
     get_series_list,
 )
 
@@ -625,6 +626,193 @@ async def run_kalshi_full_sync() -> None:
         logger.info("[kalshi.ingest] Full sync complete.")
     except Exception as exc:
         logger.error("[kalshi.ingest] Full sync failed: %s", exc, exc_info=True)
+
+
+# ---------------------------------------------------------------------------
+# DEV_MODE: restricted sync for sandbox / free-tier environments
+# ---------------------------------------------------------------------------
+
+async def run_kalshi_dev_sync() -> None:
+    """
+    DEV_MODE backfill: sync only DEV_TARGET_SERIES instead of all Kalshi markets.
+
+    Steps:
+      1. Fetch and upsert the 3 target series.
+      2. For each series, paginate through events (with nested markets).
+      3. Upsert events, markets, and outcomes.
+      4. Populate dev_config.DEV_TARGET_MARKETS with all open market tickers found.
+
+    This keeps Supabase and Redis usage minimal while still providing a realistic
+    local dataset for frontend development.
+    """
+    import app.core.dev_config as dev_cfg
+    from app.core.dev_config import DEV_TARGET_SERIES
+
+    logger.info("[kalshi.ingest] DEV_MODE: Starting restricted sync for series: %s", DEV_TARGET_SERIES)
+
+    pool = await get_asyncpg_pool()
+    now = datetime.now(timezone.utc)
+
+    # ---- Step 1: Upsert each target series ----
+    for series_ticker in DEV_TARGET_SERIES:
+        try:
+            resp = await get_series(series_ticker=series_ticker)
+            s = resp.series
+            if not s:
+                logger.warning("[kalshi.ingest] DEV: Series %s not found, skipping", series_ticker)
+                continue
+
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    """
+                    INSERT INTO series (id, exchange, ext_id, title, description, category,
+                                       tags, image_url, frequency, is_deleted, updated_at)
+                    VALUES ($1::uuid, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10, $11)
+                    ON CONFLICT ON CONSTRAINT uq_series_exchange_extid DO UPDATE SET
+                        title = EXCLUDED.title,
+                        description = EXCLUDED.description,
+                        category = EXCLUDED.category,
+                        tags = EXCLUDED.tags,
+                        image_url = EXCLUDED.image_url,
+                        frequency = EXCLUDED.frequency,
+                        updated_at = EXCLUDED.updated_at
+                    """,
+                    str(uuid.uuid4()),
+                    EXCHANGE,
+                    s.ticker,
+                    s.title,
+                    getattr(s, "description", None),
+                    getattr(s, "category", None),
+                    _json.dumps(getattr(s, "tags", None) or []),
+                    getattr(s, "image_url", None),
+                    getattr(s, "frequency", None),
+                    False,
+                    now,
+                )
+            logger.info("[kalshi.ingest] DEV: Upserted series %s", series_ticker)
+        except Exception as exc:
+            logger.error("[kalshi.ingest] DEV: Failed to sync series %s: %s", series_ticker, exc)
+
+    # Pre-load series map for FK resolution
+    series_map = await _load_ext_id_map(pool, "series")
+
+    # ---- Step 2: Sync events + markets per series ----
+    new_target_markets: list[str] = []
+    total_events = 0
+    total_markets = 0
+
+    for series_ticker in DEV_TARGET_SERIES:
+        logger.info("[kalshi.ingest] DEV: Fetching events for series %s", series_ticker)
+        cursor = None
+        page = 0
+        BATCH_SIZE = 200
+
+        while True:
+            page += 1
+            try:
+                resp = await get_events(
+                    series_ticker=series_ticker,
+                    with_nested_markets=True,
+                    limit=200,
+                    cursor=cursor,
+                    # DEV_MODE: only fetch open events to avoid syncing thousands
+                    # of historical closed/settled markets. This cuts startup time
+                    # from 3+ minutes to ~10 seconds while still giving the FE
+                    # all currently tradeable markets.
+                    status="open",
+                )
+            except Exception as exc:
+                logger.error("[kalshi.ingest] DEV: Failed to fetch events for %s page %d: %s", series_ticker, page, exc)
+                break
+
+            raw_events = resp.events or []
+            if not raw_events:
+                break
+
+            events = [KalshiEvent(**e.to_dict()) for e in raw_events]
+
+            # Build event rows
+            event_rows = []
+            non_mve_events: list[KalshiEvent] = []
+            for e in events:
+                if _is_mve(e.event_ticker) or _is_mve(e.series_ticker):
+                    continue
+                series_id = series_map.get(e.series_ticker) if e.series_ticker else None
+                platform_metadata = {
+                    "strike_date": str(e.strike_date) if e.strike_date else None,
+                    "strike_period": e.strike_period,
+                }
+                event_rows.append((
+                    str(uuid.uuid4()),
+                    str(series_id) if series_id else None,
+                    EXCHANGE,
+                    e.event_ticker,
+                    e.title,
+                    e.sub_title,
+                    e.category,
+                    e.normalized_status,
+                    e.mutually_exclusive or False,
+                    e.close_time,
+                    e.expected_expiration_time,
+                    _json.dumps(platform_metadata),
+                    False,
+                    now,
+                ))
+                non_mve_events.append(e)
+
+            # Upsert events (batched), get back {ext_id: id}
+            page_event_map: dict[str, uuid.UUID] = {}
+            for i in range(0, len(event_rows), BATCH_SIZE):
+                batch = event_rows[i : i + BATCH_SIZE]
+                batch_map = await _upsert_events_returning(pool, batch)
+                page_event_map.update(batch_map)
+            total_events += len(page_event_map)
+
+            # Build market rows
+            market_rows = []
+            valid_markets: list[KalshiMarket] = []
+            for e in non_mve_events:
+                event_id = page_event_map.get(e.event_ticker)
+                if event_id is None:
+                    continue
+                for m in (e.markets or []):
+                    market_rows.append(_build_market_row(m, event_id, now))
+                    valid_markets.append(m)
+                    if m.normalized_status == "active":
+                        new_target_markets.append(m.ticker)
+
+            # Upsert markets
+            for i in range(0, len(market_rows), BATCH_SIZE):
+                batch = market_rows[i : i + BATCH_SIZE]
+                upserted = await _upsert_markets_batch(pool, batch)
+                total_markets += upserted
+
+            # Build and upsert outcomes
+            if valid_markets:
+                valid_tickers = [m.ticker for m in valid_markets]
+                market_id_map = await _load_ext_id_map_for_keys(pool, "markets", valid_tickers)
+                outcome_rows = []
+                for m in valid_markets:
+                    mid = market_id_map.get(m.ticker)
+                    if mid:
+                        outcome_rows.extend(_build_outcome_rows(str(mid), m))
+                for i in range(0, len(outcome_rows), BATCH_SIZE):
+                    batch = outcome_rows[i : i + BATCH_SIZE]
+                    await _upsert_outcomes_batch(pool, batch)
+
+            cursor = resp.cursor
+            if not cursor:
+                break
+
+    # ---- Step 3: Populate DEV_TARGET_MARKETS ----
+    dev_cfg.DEV_TARGET_MARKETS.clear()
+    dev_cfg.DEV_TARGET_MARKETS.extend(new_target_markets)
+
+    logger.info(
+        "[kalshi.ingest] DEV_MODE sync complete: %d events, %d markets upserted, "
+        "%d open market tickers in subscription list",
+        total_events, total_markets, len(new_target_markets),
+    )
 
 
 # ---------------------------------------------------------------------------
