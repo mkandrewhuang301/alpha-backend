@@ -18,10 +18,11 @@ from kalshi_python_async.models import (
     GetEventResponse,
     GetMarketsResponse,
     GetMarketResponse,
+    GetEventMetadataResponse,
 )
 
 from app.core.config import KALSHI_API_KEY, KALSHI_PRIVATE_KEY, KALSHI_BASE_API_URL
-from app.models.kalshi import KalshiSeriesListResponse
+from app.models.kalshi import KalshiEventMetadata, KalshiSeriesListResponse
 
 logger = logging.getLogger(__name__)
 
@@ -55,8 +56,8 @@ def _get_events_api() -> EventsApi:
 async def get_series_list(
     category: str | None = None,
     tags: str | None = None,
-    include_product_metadata: bool = False,
-    include_volume: bool = False,
+    include_product_metadata: bool = True,
+    include_volume: bool = True,
     min_updated_ts: int | None = None,
 ) -> KalshiSeriesListResponse:
     """Fetch all Kalshi series.
@@ -64,6 +65,9 @@ async def get_series_list(
     Bypasses the SDK's own deserialization because the SDK's Series model
     rejects tags=null from the API. We use our KalshiSeries model instead,
     which handles Optional[List[str]] correctly.
+
+    Defaults include_product_metadata=True and include_volume=True to capture
+    image URLs and volume data for frontend display.
     """
     try:
         market_api = _get_market_api()
@@ -149,6 +153,27 @@ async def get_event(
     except Exception as exc:
         logger.error("[kalshi] Failed to fetch event %s: %s", event_ticker, exc)
         raise
+
+
+# ---------------------------------------------------------------------------
+# Event Metadata
+# ---------------------------------------------------------------------------
+
+async def get_event_metadata(event_ticker: str) -> KalshiEventMetadata | None:
+    """Fetch display metadata for an event (images, colors, settlement sources).
+
+    Returns None on error instead of raising — metadata is supplementary
+    and should not block the sync.
+    """
+    try:
+        events_api = _get_events_api()
+        resp: GetEventMetadataResponse = await events_api.get_event_metadata(
+            event_ticker=event_ticker,
+        )
+        return KalshiEventMetadata(**resp.to_dict())
+    except Exception as exc:
+        logger.warning("[kalshi] Failed to fetch event metadata for %s: %s", event_ticker, exc)
+        return None
 
 
 # ---------------------------------------------------------------------------

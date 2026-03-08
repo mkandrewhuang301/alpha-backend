@@ -26,9 +26,9 @@ from app.models.kalshi import (
     KalshiMarket,
 )
 from app.services.kalshi import (
+    get_event_metadata,
     get_events,
     get_markets,
-    get_series,
     get_series_list,
 )
 
@@ -108,18 +108,29 @@ async def sync_series() -> int:
     now = datetime.now(timezone.utc)
     rows = []
     for s in series_list:
+        settlement_sources = [
+            {"name": ss.name, "url": ss.url}
+            for ss in (s.settlement_sources or [])
+        ]
         rows.append((
-            str(uuid.uuid4()),       # id
-            EXCHANGE,                # exchange
-            s.ticker,                # ext_id
-            s.title,                 # title
-            s.description,           # description
-            s.category,              # category
-            _json.dumps(s.tags or []),  # tags (JSONB)
-            s.image_url,             # image_url
-            s.frequency,             # frequency
-            False,                   # is_deleted
-            now,                     # updated_at
+            str(uuid.uuid4()),                         # id
+            EXCHANGE,                                  # exchange
+            s.ticker,                                  # ext_id
+            s.title,                                   # title
+            s.description,                             # description (from product_metadata)
+            s.category,                                # category
+            _json.dumps(s.tags or []),                  # tags (JSONB)
+            s.image_url,                               # image_url (from product_metadata)
+            s.frequency,                               # frequency
+            _json.dumps(settlement_sources),           # settlement_sources (JSONB)
+            s.contract_url,                            # contract_url
+            _json.dumps(s.additional_prohibitions or []),  # additional_prohibitions (JSONB)
+            s.fee_type,                                # fee_type
+            s.fee_multiplier,                          # fee_multiplier
+            s.volume or 0,                             # volume_24h (use volume from API)
+            s.volume or 0,                             # total_volume
+            False,                                     # is_deleted
+            now,                                       # updated_at
         ))
 
     logger.info("[kalshi.ingest] Prepared %d series rows for batch upsert", len(rows))
@@ -134,8 +145,13 @@ async def sync_series() -> int:
             async with pool.acquire() as conn:
                 await conn.executemany(
                     """
-                    INSERT INTO series (id, exchange, ext_id, title, description, category, tags, image_url, frequency, is_deleted, updated_at)
-                    VALUES ($1::uuid, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10, $11)
+                    INSERT INTO series (id, exchange, ext_id, title, description, category, tags,
+                                       image_url, frequency, settlement_sources, contract_url,
+                                       additional_prohibitions, fee_type, fee_multiplier,
+                                       volume_24h, total_volume, is_deleted, updated_at)
+                    VALUES ($1::uuid, $2, $3, $4, $5, $6, $7::jsonb, $8, $9,
+                            $10::jsonb, $11, $12::jsonb, $13, $14::numeric,
+                            $15::numeric, $16::numeric, $17, $18)
                     ON CONFLICT ON CONSTRAINT uq_series_exchange_extid DO UPDATE SET
                         title = EXCLUDED.title,
                         description = EXCLUDED.description,
@@ -143,6 +159,13 @@ async def sync_series() -> int:
                         tags = EXCLUDED.tags,
                         image_url = EXCLUDED.image_url,
                         frequency = EXCLUDED.frequency,
+                        settlement_sources = EXCLUDED.settlement_sources,
+                        contract_url = EXCLUDED.contract_url,
+                        additional_prohibitions = EXCLUDED.additional_prohibitions,
+                        fee_type = EXCLUDED.fee_type,
+                        fee_multiplier = EXCLUDED.fee_multiplier,
+                        volume_24h = EXCLUDED.volume_24h,
+                        total_volume = EXCLUDED.total_volume,
                         updated_at = EXCLUDED.updated_at
                     """,
                     batch,
@@ -204,31 +227,55 @@ async def _upsert_markets_batch(pool, rows: list[tuple]) -> int:
 
     # Transpose rows into column arrays for UNNEST
     ids, event_ids, exchanges, ext_ids, titles, subtitles = [], [], [], [], [], []
+    yes_sub_titles, no_sub_titles = [], []
     types, statuses, open_times, close_times, resolve_times = [], [], [], [], []
-    results, rules_primaries, rules_secondaries, platform_metas = [], [], [], []
+    results, rules_primaries, rules_secondaries = [], [], []
+    image_urls, color_codes = [], []
+    fractional_tradings, response_price_units_list, strike_types = [], [], []
+    open_interests, volumes, volumes_24h, total_volumes, liquidities = [], [], [], [], []
+    platform_metas = []
     is_deleteds, updated_ats = [], []
 
     for r in rows:
         ids.append(r[0]); event_ids.append(r[1]); exchanges.append(r[2])
         ext_ids.append(r[3]); titles.append(r[4]); subtitles.append(r[5])
-        types.append(r[6]); statuses.append(r[7]); open_times.append(r[8])
-        close_times.append(r[9]); resolve_times.append(r[10]); results.append(r[11])
-        rules_primaries.append(r[12]); rules_secondaries.append(r[13])
-        platform_metas.append(r[14]); is_deleteds.append(r[15]); updated_ats.append(r[16])
+        yes_sub_titles.append(r[6]); no_sub_titles.append(r[7])
+        types.append(r[8]); statuses.append(r[9]); open_times.append(r[10])
+        close_times.append(r[11]); resolve_times.append(r[12]); results.append(r[13])
+        rules_primaries.append(r[14]); rules_secondaries.append(r[15])
+        image_urls.append(r[16]); color_codes.append(r[17])
+        fractional_tradings.append(r[18]); response_price_units_list.append(r[19])
+        strike_types.append(r[20])
+        open_interests.append(r[21]); volumes.append(r[22])
+        volumes_24h.append(r[23]); total_volumes.append(r[24]); liquidities.append(r[25])
+        platform_metas.append(r[26]); is_deleteds.append(r[27]); updated_ats.append(r[28])
 
     query = """
-        INSERT INTO markets (id, event_id, exchange, ext_id, title, subtitle, type, status,
-                            open_time, close_time, resolve_time, result, rules_primary,
-                            rules_secondary, platform_metadata, is_deleted, updated_at)
+        INSERT INTO markets (id, event_id, exchange, ext_id, title, subtitle,
+                            yes_sub_title, no_sub_title,
+                            type, status, open_time, close_time, resolve_time,
+                            result, rules_primary, rules_secondary,
+                            image_url, color_code,
+                            fractional_trading_enabled, response_price_units, strike_type,
+                            open_interest, volume, volume_24h, total_volume, liquidity,
+                            platform_metadata, is_deleted, updated_at)
         SELECT
             unnest($1::uuid[]), unnest($2::uuid[]), unnest($3::exchange_type[]), unnest($4::text[]),
-            unnest($5::text[]), unnest($6::text[]), unnest($7::market_type[]), unnest($8::market_status[]),
-            unnest($9::timestamptz[]), unnest($10::timestamptz[]), unnest($11::timestamptz[]),
-            unnest($12::text[]), unnest($13::text[]), unnest($14::text[]),
-            unnest($15::jsonb[]), unnest($16::boolean[]), unnest($17::timestamptz[])
+            unnest($5::text[]), unnest($6::text[]),
+            unnest($7::text[]), unnest($8::text[]),
+            unnest($9::market_type[]), unnest($10::market_status[]),
+            unnest($11::timestamptz[]), unnest($12::timestamptz[]), unnest($13::timestamptz[]),
+            unnest($14::text[]), unnest($15::text[]), unnest($16::text[]),
+            unnest($17::text[]), unnest($18::text[]),
+            unnest($19::boolean[]), unnest($20::text[]), unnest($21::text[]),
+            unnest($22::numeric[]), unnest($23::numeric[]),
+            unnest($24::numeric[]), unnest($25::numeric[]), unnest($26::numeric[]),
+            unnest($27::jsonb[]), unnest($28::boolean[]), unnest($29::timestamptz[])
         ON CONFLICT ON CONSTRAINT uq_markets_exchange_extid DO UPDATE SET
             title = EXCLUDED.title,
             subtitle = EXCLUDED.subtitle,
+            yes_sub_title = EXCLUDED.yes_sub_title,
+            no_sub_title = EXCLUDED.no_sub_title,
             type = EXCLUDED.type,
             status = EXCLUDED.status,
             open_time = EXCLUDED.open_time,
@@ -237,6 +284,16 @@ async def _upsert_markets_batch(pool, rows: list[tuple]) -> int:
             result = EXCLUDED.result,
             rules_primary = EXCLUDED.rules_primary,
             rules_secondary = EXCLUDED.rules_secondary,
+            image_url = COALESCE(EXCLUDED.image_url, markets.image_url),
+            color_code = COALESCE(EXCLUDED.color_code, markets.color_code),
+            fractional_trading_enabled = EXCLUDED.fractional_trading_enabled,
+            response_price_units = EXCLUDED.response_price_units,
+            strike_type = EXCLUDED.strike_type,
+            open_interest = EXCLUDED.open_interest,
+            volume = EXCLUDED.volume,
+            volume_24h = EXCLUDED.volume_24h,
+            total_volume = EXCLUDED.total_volume,
+            liquidity = EXCLUDED.liquidity,
             platform_metadata = EXCLUDED.platform_metadata,
             updated_at = EXCLUDED.updated_at
     """
@@ -246,8 +303,12 @@ async def _upsert_markets_batch(pool, rows: list[tuple]) -> int:
             await conn.execute(
                 query,
                 ids, event_ids, exchanges, ext_ids, titles, subtitles,
+                yes_sub_titles, no_sub_titles,
                 types, statuses, open_times, close_times, resolve_times,
                 results, rules_primaries, rules_secondaries,
+                image_urls, color_codes,
+                fractional_tradings, response_price_units_list, strike_types,
+                open_interests, volumes, volumes_24h, total_volumes, liquidities,
                 platform_metas, is_deleteds, updated_ats,
             )
         return len(rows)
@@ -261,16 +322,39 @@ async def _upsert_markets_batch(pool, rows: list[tuple]) -> int:
             async with pool.acquire() as conn:
                 await conn.execute(
                     """
-                    INSERT INTO markets (id, event_id, exchange, ext_id, title, subtitle, type, status,
-                                        open_time, close_time, resolve_time, result, rules_primary,
-                                        rules_secondary, platform_metadata, is_deleted, updated_at)
-                    VALUES ($1::uuid, $2::uuid, $3::exchange_type, $4, $5, $6, $7::market_type, $8::market_status,
-                            $9, $10, $11, $12, $13, $14, $15::jsonb, $16, $17)
+                    INSERT INTO markets (id, event_id, exchange, ext_id, title, subtitle,
+                                        yes_sub_title, no_sub_title,
+                                        type, status, open_time, close_time, resolve_time,
+                                        result, rules_primary, rules_secondary,
+                                        image_url, color_code,
+                                        fractional_trading_enabled, response_price_units, strike_type,
+                                        open_interest, volume, volume_24h, total_volume, liquidity,
+                                        platform_metadata, is_deleted, updated_at)
+                    VALUES ($1::uuid, $2::uuid, $3::exchange_type, $4, $5, $6,
+                            $7, $8,
+                            $9::market_type, $10::market_status,
+                            $11, $12, $13,
+                            $14, $15, $16,
+                            $17, $18,
+                            $19, $20, $21,
+                            $22::numeric, $23::numeric,
+                            $24::numeric, $25::numeric, $26::numeric,
+                            $27::jsonb, $28, $29)
                     ON CONFLICT ON CONSTRAINT uq_markets_exchange_extid DO UPDATE SET
-                        title = EXCLUDED.title, subtitle = EXCLUDED.subtitle, type = EXCLUDED.type,
-                        status = EXCLUDED.status, open_time = EXCLUDED.open_time, close_time = EXCLUDED.close_time,
+                        title = EXCLUDED.title, subtitle = EXCLUDED.subtitle,
+                        yes_sub_title = EXCLUDED.yes_sub_title, no_sub_title = EXCLUDED.no_sub_title,
+                        type = EXCLUDED.type, status = EXCLUDED.status,
+                        open_time = EXCLUDED.open_time, close_time = EXCLUDED.close_time,
                         resolve_time = EXCLUDED.resolve_time, result = EXCLUDED.result,
                         rules_primary = EXCLUDED.rules_primary, rules_secondary = EXCLUDED.rules_secondary,
+                        image_url = COALESCE(EXCLUDED.image_url, markets.image_url),
+                        color_code = COALESCE(EXCLUDED.color_code, markets.color_code),
+                        fractional_trading_enabled = EXCLUDED.fractional_trading_enabled,
+                        response_price_units = EXCLUDED.response_price_units,
+                        strike_type = EXCLUDED.strike_type,
+                        open_interest = EXCLUDED.open_interest, volume = EXCLUDED.volume,
+                        volume_24h = EXCLUDED.volume_24h, total_volume = EXCLUDED.total_volume,
+                        liquidity = EXCLUDED.liquidity,
                         platform_metadata = EXCLUDED.platform_metadata, updated_at = EXCLUDED.updated_at
                     """,
                     *r,
@@ -279,7 +363,7 @@ async def _upsert_markets_batch(pool, rows: list[tuple]) -> int:
         except Exception as row_exc:
             logger.error(
                 "[kalshi.ingest] SKIPPED market ext_id=%s type=%s status=%s — row upsert failed: %s",
-                r[3], r[6], r[7], row_exc,
+                r[3], r[8], r[9], row_exc,
             )
     return upserted
 
@@ -342,37 +426,129 @@ async def _upsert_outcomes_batch(pool, rows: list[tuple]) -> int:
     return upserted
 
 
-def _build_market_row(m: KalshiMarket, event_id: uuid.UUID, now: datetime) -> tuple:
-    """Build a single market upsert row tuple from a KalshiMarket and its resolved event_id."""
+def _build_market_row(
+    m: KalshiMarket,
+    event_id: uuid.UUID,
+    now: datetime,
+    market_metadata: dict[str, dict] | None = None,
+) -> tuple:
+    """Build a single market upsert row tuple from a KalshiMarket and its resolved event_id.
+
+    Args:
+        market_metadata: optional {market_ticker: {image_url, color_code}} from event metadata
+    """
     platform_metadata = {
-        "strike_type": m.strike_type,
         "floor_strike": m.floor_strike,
         "cap_strike": m.cap_strike,
         "risk_limit_cents": m.risk_limit_cents,
         "settlement_timer_seconds": m.settlement_timer_seconds,
         "can_close_early": m.can_close_early,
-        "response_price_units": m.response_price_units,
-        "volume_24h": m.volume_24h if hasattr(m, "volume_24h") else None,
+        "early_close_condition": m.early_close_condition,
+        "price_level_structure": m.price_level_structure,
+        "is_provisional": m.is_provisional,
     }
 
+    # Get per-market display metadata from event metadata if available
+    meta = (market_metadata or {}).get(m.ticker, {})
+    image_url = meta.get("image_url")
+    color_code = meta.get("color_code")
+
+    # Parse fixed-point volume fields when available
+    volume_24h = None
+    if hasattr(m, "volume_24h") and m.volume_24h is not None:
+        volume_24h = m.volume_24h
+
     return (
-        str(uuid.uuid4()),                   # id
-        str(event_id),                       # event_id
-        EXCHANGE,                            # exchange
-        m.ticker,                            # ext_id
-        m.title,                             # title
-        m.subtitle,                          # subtitle
-        m.normalized_market_type,            # type
-        m.normalized_status,                 # status
-        m.open_time,                         # open_time
-        m.close_time,                        # close_time
-        m.expiration_time,                   # resolve_time
-        m.result,                            # result
-        m.rules_primary,                     # rules_primary
-        m.rules_secondary,                   # rules_secondary
-        _json.dumps(platform_metadata),      # platform_metadata
-        False,                               # is_deleted
-        now,                                 # updated_at
+        str(uuid.uuid4()),                   # 0: id
+        str(event_id),                       # 1: event_id
+        EXCHANGE,                            # 2: exchange
+        m.ticker,                            # 3: ext_id
+        m.title,                             # 4: title
+        m.subtitle,                          # 5: subtitle
+        m.yes_sub_title,                     # 6: yes_sub_title
+        m.no_sub_title,                      # 7: no_sub_title
+        m.normalized_market_type,            # 8: type
+        m.normalized_status,                 # 9: status
+        m.open_time,                         # 10: open_time
+        m.close_time,                        # 11: close_time
+        m.expiration_time,                   # 12: resolve_time
+        m.result,                            # 13: result
+        m.rules_primary,                     # 14: rules_primary
+        m.rules_secondary,                   # 15: rules_secondary
+        image_url,                           # 16: image_url
+        color_code,                          # 17: color_code
+        m.fractional_trading_enabled or False,  # 18: fractional_trading_enabled
+        m.response_price_units,              # 19: response_price_units
+        m.strike_type,                       # 20: strike_type
+        m.open_interest,                     # 21: open_interest
+        m.volume,                            # 22: volume
+        volume_24h,                          # 23: volume_24h
+        m.volume,                            # 24: total_volume (same as volume on initial sync)
+        m.liquidity,                         # 25: liquidity
+        _json.dumps(platform_metadata),      # 26: platform_metadata
+        False,                               # 27: is_deleted
+        now,                                 # 28: updated_at
+    )
+
+
+def _build_event_row(
+    e: KalshiEvent,
+    series_id: uuid.UUID | None,
+    now: datetime,
+    event_meta=None,
+) -> tuple:
+    """Build a single event upsert row from a KalshiEvent."""
+    platform_metadata = {
+        "strike_date": str(e.strike_date) if e.strike_date else None,
+        "strike_period": e.strike_period,
+        "collateral_return_type": e.collateral_return_type,
+        "available_on_brokers": e.available_on_brokers,
+        "product_metadata": e.product_metadata,
+    }
+
+    # Extract display metadata from event metadata response if available
+    event_image_url = None
+    image_url = None
+    featured_image_url = None
+    settlement_sources_json = _json.dumps([])
+    competition = None
+    competition_scope = None
+
+    if event_meta:
+        event_image_url = event_meta.image_url
+        image_url = event_meta.image_url
+        featured_image_url = event_meta.featured_image_url
+        settlement_sources_json = _json.dumps([
+            {"name": ss.name, "url": ss.url}
+            for ss in (event_meta.settlement_sources or [])
+        ])
+        competition = event_meta.competition
+        competition_scope = event_meta.competition_scope
+
+    return (
+        str(uuid.uuid4()),                         # 0: id
+        str(series_id) if series_id else None,     # 1: series_id
+        EXCHANGE,                                  # 2: exchange
+        e.event_ticker,                            # 3: ext_id
+        e.title,                                   # 4: title
+        e.sub_title,                               # 5: description
+        e.sub_title,                               # 6: sub_title
+        e.category,                                # 7: category
+        e.normalized_status,                       # 8: status
+        e.mutually_exclusive or False,             # 9: mutually_exclusive
+        e.close_time,                              # 10: close_time
+        e.expected_expiration_time,                # 11: expected_expiration_time
+        event_image_url,                           # 12: event_image_url
+        image_url,                                 # 13: image_url
+        featured_image_url,                        # 14: featured_image_url
+        settlement_sources_json,                   # 15: settlement_sources (JSONB)
+        competition,                               # 16: competition
+        competition_scope,                         # 17: competition_scope
+        0,                                         # 18: total_volume (aggregated later)
+        0,                                         # 19: open_interest (aggregated later)
+        _json.dumps(platform_metadata),            # 20: platform_metadata
+        False,                                     # 21: is_deleted
+        now,                                       # 22: updated_at
     )
 
 
@@ -385,36 +561,70 @@ async def _upsert_events_returning(pool, rows: list[tuple]) -> dict[str, uuid.UU
         return {}
 
     ids, series_ids, exchanges, ext_ids, titles, descriptions = [], [], [], [], [], []
+    sub_titles = []
     categories, statuses, mutually_exclusives = [], [], []
-    close_times, expected_expiration_times, platform_metas = [], [], []
+    close_times, expected_expiration_times = [], []
+    event_image_urls, image_urls, featured_image_urls, settlement_sources_list = [], [], [], []
+    competitions, competition_scopes = [], []
+    total_volumes, open_interests = [], []
+    platform_metas = []
     is_deleteds, updated_ats = [], []
 
     for r in rows:
         ids.append(r[0]); series_ids.append(r[1]); exchanges.append(r[2])
         ext_ids.append(r[3]); titles.append(r[4]); descriptions.append(r[5])
-        categories.append(r[6]); statuses.append(r[7]); mutually_exclusives.append(r[8])
-        close_times.append(r[9]); expected_expiration_times.append(r[10])
-        platform_metas.append(r[11]); is_deleteds.append(r[12]); updated_ats.append(r[13])
+        sub_titles.append(r[6])
+        categories.append(r[7]); statuses.append(r[8]); mutually_exclusives.append(r[9])
+        close_times.append(r[10]); expected_expiration_times.append(r[11])
+        event_image_urls.append(r[12]); image_urls.append(r[13])
+        featured_image_urls.append(r[14])
+        settlement_sources_list.append(r[15])
+        competitions.append(r[16]); competition_scopes.append(r[17])
+        total_volumes.append(r[18]); open_interests.append(r[19])
+        platform_metas.append(r[20]); is_deleteds.append(r[21]); updated_ats.append(r[22])
 
     query = """
-        INSERT INTO events (id, series_id, exchange, ext_id, title, description, category,
+        INSERT INTO events (id, series_id, exchange, ext_id, title, description,
+                           sub_title, category,
                            status, mutually_exclusive, close_time, expected_expiration_time,
+                           event_image_url, image_url, featured_image_url, settlement_sources,
+                           competition, competition_scope,
+                           total_volume, open_interest,
                            platform_metadata, is_deleted, updated_at)
         SELECT
             unnest($1::uuid[]), unnest($2::uuid[]), unnest($3::exchange_type[]), unnest($4::text[]),
-            unnest($5::text[]), unnest($6::text[]), unnest($7::text[]),
-            unnest($8::market_status[]), unnest($9::boolean[]), unnest($10::timestamptz[]),
-            unnest($11::timestamptz[]), unnest($12::jsonb[]), unnest($13::boolean[]),
-            unnest($14::timestamptz[])
+            unnest($5::text[]), unnest($6::text[]),
+            unnest($7::text[]), unnest($8::text[]),
+            unnest($9::market_status[]), unnest($10::boolean[]), unnest($11::timestamptz[]),
+            unnest($12::timestamptz[]),
+            unnest($13::text[]), unnest($14::text[]), unnest($15::text[]),
+            unnest($16::jsonb[]),
+            unnest($17::text[]), unnest($18::text[]),
+            unnest($19::numeric[]), unnest($20::numeric[]),
+            unnest($21::jsonb[]), unnest($22::boolean[]),
+            unnest($23::timestamptz[])
         ON CONFLICT ON CONSTRAINT uq_events_exchange_extid DO UPDATE SET
             series_id = EXCLUDED.series_id,
             title = EXCLUDED.title,
             description = EXCLUDED.description,
+            sub_title = EXCLUDED.sub_title,
             category = EXCLUDED.category,
             status = EXCLUDED.status,
             mutually_exclusive = EXCLUDED.mutually_exclusive,
             close_time = EXCLUDED.close_time,
             expected_expiration_time = EXCLUDED.expected_expiration_time,
+            event_image_url = COALESCE(EXCLUDED.event_image_url, events.event_image_url),
+            image_url = COALESCE(EXCLUDED.image_url, events.image_url),
+            featured_image_url = COALESCE(EXCLUDED.featured_image_url, events.featured_image_url),
+            settlement_sources = CASE
+                WHEN EXCLUDED.settlement_sources::text != '[]' THEN EXCLUDED.settlement_sources
+                ELSE events.settlement_sources
+            END,
+            competition = COALESCE(EXCLUDED.competition, events.competition),
+            competition_scope = COALESCE(EXCLUDED.competition_scope, events.competition_scope),
+            total_volume = EXCLUDED.total_volume,
+            open_interest = EXCLUDED.open_interest,
+            platform_metadata = EXCLUDED.platform_metadata,
             updated_at = EXCLUDED.updated_at
         RETURNING ext_id, id
     """
@@ -424,8 +634,12 @@ async def _upsert_events_returning(pool, rows: list[tuple]) -> dict[str, uuid.UU
             result_rows = await conn.fetch(
                 query,
                 ids, series_ids, exchanges, ext_ids, titles, descriptions,
-                categories, statuses, mutually_exclusives,
+                sub_titles, categories, statuses, mutually_exclusives,
                 close_times, expected_expiration_times,
+                event_image_urls, image_urls, featured_image_urls,
+                settlement_sources_list,
+                competitions, competition_scopes,
+                total_volumes, open_interests,
                 platform_metas, is_deleteds, updated_ats,
             )
         return {r["ext_id"]: r["id"] for r in result_rows}
@@ -482,7 +696,6 @@ async def sync_events_and_markets() -> tuple[int, int]:
 
         # --- Build event rows (skip MVE) ---
         event_rows = []
-        # Track which events are non-MVE so we process their markets
         non_mve_events: list[KalshiEvent] = []
 
         for e in events:
@@ -493,27 +706,7 @@ async def sync_events_and_markets() -> tuple[int, int]:
             if e.series_ticker:
                 series_id = series_map.get(e.series_ticker)
 
-            platform_metadata = {
-                "strike_date": str(e.strike_date) if e.strike_date else None,
-                "strike_period": e.strike_period,
-            }
-
-            event_rows.append((
-                str(uuid.uuid4()),                    # id
-                str(series_id) if series_id else None, # series_id
-                EXCHANGE,                              # exchange
-                e.event_ticker,                        # ext_id
-                e.title,                               # title
-                e.sub_title,                           # description
-                e.category,                            # category
-                e.normalized_status,                   # status
-                e.mutually_exclusive or False,          # mutually_exclusive
-                e.close_time,                          # close_time
-                e.expected_expiration_time,             # expected_expiration_time
-                _json.dumps(platform_metadata),        # platform_metadata
-                False,                                 # is_deleted
-                now,                                   # updated_at
-            ))
+            event_rows.append(_build_event_row(e, series_id, now))
             non_mve_events.append(e)
 
         # Upsert events and get back {ext_id: id} mapping
@@ -632,80 +825,139 @@ async def run_kalshi_full_sync() -> None:
 # DEV_MODE: restricted sync for sandbox / free-tier environments
 # ---------------------------------------------------------------------------
 
+
+async def _upsert_single_series(pool, s, now: datetime) -> None:
+    """Upsert a single series row (used in dev sync for individual series)."""
+    settlement_sources = [
+        {"name": ss.name, "url": ss.url}
+        for ss in (s.settlement_sources or [])
+    ]
+
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO series (id, exchange, ext_id, title, description, category,
+                               tags, image_url, frequency, settlement_sources,
+                               contract_url, additional_prohibitions,
+                               fee_type, fee_multiplier, volume_24h, total_volume,
+                               is_deleted, updated_at)
+            VALUES ($1::uuid, $2, $3, $4, $5, $6, $7::jsonb, $8, $9,
+                    $10::jsonb, $11, $12::jsonb,
+                    $13, $14::numeric, $15::numeric, $16::numeric,
+                    $17, $18)
+            ON CONFLICT ON CONSTRAINT uq_series_exchange_extid DO UPDATE SET
+                title = EXCLUDED.title,
+                description = EXCLUDED.description,
+                category = EXCLUDED.category,
+                tags = EXCLUDED.tags,
+                image_url = EXCLUDED.image_url,
+                frequency = EXCLUDED.frequency,
+                settlement_sources = EXCLUDED.settlement_sources,
+                contract_url = EXCLUDED.contract_url,
+                additional_prohibitions = EXCLUDED.additional_prohibitions,
+                fee_type = EXCLUDED.fee_type,
+                fee_multiplier = EXCLUDED.fee_multiplier,
+                volume_24h = EXCLUDED.volume_24h,
+                total_volume = EXCLUDED.total_volume,
+                updated_at = EXCLUDED.updated_at
+            """,
+            str(uuid.uuid4()),
+            EXCHANGE,
+            s.ticker,
+            s.title,
+            getattr(s, "description", None),
+            getattr(s, "category", None),
+            _json.dumps(getattr(s, "tags", None) or []),
+            getattr(s, "image_url", None),
+            getattr(s, "frequency", None),
+            _json.dumps(settlement_sources),
+            getattr(s, "contract_url", None),
+            _json.dumps(getattr(s, "additional_prohibitions", None) or []),
+            getattr(s, "fee_type", None),
+            getattr(s, "fee_multiplier", None),
+            getattr(s, "volume", None) or 0,
+            getattr(s, "volume", None) or 0,
+            False,
+            now,
+        )
+
+
 async def run_kalshi_dev_sync() -> None:
     """
-    DEV_MODE backfill: sync only DEV_TARGET_SERIES instead of all Kalshi markets.
+    DEV_MODE backfill: sync the explicit curated set of Kalshi series defined
+    in dev_config.DEV_EXPLICIT_SERIES_FLAT.
 
     Steps:
-      1. Fetch and upsert the 3 target series.
-      2. For each series, paginate through events (with nested markets).
-      3. Upsert events, markets, and outcomes.
-      4. Populate dev_config.DEV_TARGET_MARKETS with all open market tickers found.
-
-    This keeps Supabase and Redis usage minimal while still providing a realistic
-    local dataset for frontend development.
+      1. Fetch all series from Kalshi API, filter to DEV_EXPLICIT_SERIES_FLAT tickers.
+      2. Upsert selected series.
+      3. For each series, paginate through open events (with nested markets).
+      4. Fetch event metadata (images, colors, settlement sources) for each event.
+      5. Upsert events, markets, and outcomes with full display metadata.
+      6. Populate dev_config.DEV_TARGET_SERIES and DEV_TARGET_MARKETS.
     """
     import app.core.dev_config as dev_cfg
-    from app.core.dev_config import DEV_TARGET_SERIES
+    from app.core.dev_config import DEV_EXPLICIT_SERIES, DEV_EXPLICIT_SERIES_FLAT
 
-    logger.info("[kalshi.ingest] DEV_MODE: Starting restricted sync for series: %s", DEV_TARGET_SERIES)
+    logger.info(
+        "[kalshi.ingest] DEV_MODE: Starting explicit series sync (%d tickers across %d categories)...",
+        len(DEV_EXPLICIT_SERIES_FLAT),
+        len(DEV_EXPLICIT_SERIES),
+    )
 
     pool = await get_asyncpg_pool()
     now = datetime.now(timezone.utc)
 
-    # ---- Step 1: Upsert each target series ----
-    for series_ticker in DEV_TARGET_SERIES:
-        try:
-            resp = await get_series(series_ticker=series_ticker)
-            s = resp.series
-            if not s:
-                logger.warning("[kalshi.ingest] DEV: Series %s not found, skipping", series_ticker)
-                continue
+    # ---- Step 1: Fetch all series, filter to explicit list ----
+    try:
+        resp = await get_series_list()
+    except Exception as exc:
+        logger.error("[kalshi.ingest] DEV: Failed to fetch series list: %s", exc)
+        return
 
-            async with pool.acquire() as conn:
-                await conn.execute(
-                    """
-                    INSERT INTO series (id, exchange, ext_id, title, description, category,
-                                       tags, image_url, frequency, is_deleted, updated_at)
-                    VALUES ($1::uuid, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10, $11)
-                    ON CONFLICT ON CONSTRAINT uq_series_exchange_extid DO UPDATE SET
-                        title = EXCLUDED.title,
-                        description = EXCLUDED.description,
-                        category = EXCLUDED.category,
-                        tags = EXCLUDED.tags,
-                        image_url = EXCLUDED.image_url,
-                        frequency = EXCLUDED.frequency,
-                        updated_at = EXCLUDED.updated_at
-                    """,
-                    str(uuid.uuid4()),
-                    EXCHANGE,
-                    s.ticker,
-                    s.title,
-                    getattr(s, "description", None),
-                    getattr(s, "category", None),
-                    _json.dumps(getattr(s, "tags", None) or []),
-                    getattr(s, "image_url", None),
-                    getattr(s, "frequency", None),
-                    False,
-                    now,
-                )
-            logger.info("[kalshi.ingest] DEV: Upserted series %s", series_ticker)
+    all_series = resp.series or []
+    if not all_series:
+        logger.warning("[kalshi.ingest] DEV: No series returned from Kalshi API")
+        return
+
+    explicit_set = set(DEV_EXPLICIT_SERIES_FLAT)
+    selected_series = [s for s in all_series if s.ticker in explicit_set]
+    found_tickers = {s.ticker for s in selected_series}
+    missing = explicit_set - found_tickers
+    if missing:
+        logger.warning(
+            "[kalshi.ingest] DEV: %d explicit series not found in Kalshi API: %s",
+            len(missing), sorted(missing),
+        )
+
+    for cat, tickers in DEV_EXPLICIT_SERIES.items():
+        found_in_cat = [t for t in tickers if t in found_tickers]
+        logger.info(
+            "[kalshi.ingest] DEV: Category '%s' — %d/%d series found: %s",
+            cat, len(found_in_cat), len(tickers), found_in_cat,
+        )
+
+    # ---- Step 2: Upsert selected series ----
+    for s in selected_series:
+        try:
+            await _upsert_single_series(pool, s, now)
+            logger.info("[kalshi.ingest] DEV: Upserted series %s (%s)", s.ticker, s.category)
         except Exception as exc:
-            logger.error("[kalshi.ingest] DEV: Failed to sync series %s: %s", series_ticker, exc)
+            logger.error("[kalshi.ingest] DEV: Failed to sync series %s: %s", s.ticker, exc)
 
     # Pre-load series map for FK resolution
     series_map = await _load_ext_id_map(pool, "series")
+    target_series_tickers = [s.ticker for s in selected_series]
 
-    # ---- Step 2: Sync events + markets per series ----
+    # ---- Step 3: Sync events + markets per series ----
     new_target_markets: list[str] = []
     total_events = 0
     total_markets = 0
+    BATCH_SIZE = 200
 
-    for series_ticker in DEV_TARGET_SERIES:
+    for series_ticker in target_series_tickers:
         logger.info("[kalshi.ingest] DEV: Fetching events for series %s", series_ticker)
         cursor = None
         page = 0
-        BATCH_SIZE = 200
 
         while True:
             page += 1
@@ -715,10 +967,6 @@ async def run_kalshi_dev_sync() -> None:
                     with_nested_markets=True,
                     limit=200,
                     cursor=cursor,
-                    # DEV_MODE: only fetch open events to avoid syncing thousands
-                    # of historical closed/settled markets. This cuts startup time
-                    # from 3+ minutes to ~10 seconds while still giving the FE
-                    # all currently tradeable markets.
                     status="open",
                 )
             except Exception as exc:
@@ -731,6 +979,23 @@ async def run_kalshi_dev_sync() -> None:
 
             events = [KalshiEvent(**e.to_dict()) for e in raw_events]
 
+            # ---- Fetch event metadata for display data ----
+            event_metadata_cache: dict[str, object] = {}
+            market_metadata_cache: dict[str, dict] = {}
+
+            for e in events:
+                if _is_mve(e.event_ticker):
+                    continue
+                meta = await get_event_metadata(e.event_ticker)
+                if meta:
+                    event_metadata_cache[e.event_ticker] = meta
+                    # Build per-market metadata lookup
+                    for md in (meta.market_details or []):
+                        market_metadata_cache[md.market_ticker] = {
+                            "image_url": md.image_url,
+                            "color_code": md.color_code,
+                        }
+
             # Build event rows
             event_rows = []
             non_mve_events: list[KalshiEvent] = []
@@ -738,26 +1003,8 @@ async def run_kalshi_dev_sync() -> None:
                 if _is_mve(e.event_ticker) or _is_mve(e.series_ticker):
                     continue
                 series_id = series_map.get(e.series_ticker) if e.series_ticker else None
-                platform_metadata = {
-                    "strike_date": str(e.strike_date) if e.strike_date else None,
-                    "strike_period": e.strike_period,
-                }
-                event_rows.append((
-                    str(uuid.uuid4()),
-                    str(series_id) if series_id else None,
-                    EXCHANGE,
-                    e.event_ticker,
-                    e.title,
-                    e.sub_title,
-                    e.category,
-                    e.normalized_status,
-                    e.mutually_exclusive or False,
-                    e.close_time,
-                    e.expected_expiration_time,
-                    _json.dumps(platform_metadata),
-                    False,
-                    now,
-                ))
+                event_meta = event_metadata_cache.get(e.event_ticker)
+                event_rows.append(_build_event_row(e, series_id, now, event_meta))
                 non_mve_events.append(e)
 
             # Upsert events (batched), get back {ext_id: id}
@@ -776,7 +1023,9 @@ async def run_kalshi_dev_sync() -> None:
                 if event_id is None:
                     continue
                 for m in (e.markets or []):
-                    market_rows.append(_build_market_row(m, event_id, now))
+                    market_rows.append(
+                        _build_market_row(m, event_id, now, market_metadata_cache)
+                    )
                     valid_markets.append(m)
                     if m.normalized_status == "active":
                         new_target_markets.append(m.ticker)
@@ -804,13 +1053,16 @@ async def run_kalshi_dev_sync() -> None:
             if not cursor:
                 break
 
-    # ---- Step 3: Populate DEV_TARGET_MARKETS ----
+    # ---- Step 4: Populate DEV_TARGET_SERIES and DEV_TARGET_MARKETS ----
+    dev_cfg.DEV_TARGET_SERIES.clear()
+    dev_cfg.DEV_TARGET_SERIES.extend(target_series_tickers)
     dev_cfg.DEV_TARGET_MARKETS.clear()
     dev_cfg.DEV_TARGET_MARKETS.extend(new_target_markets)
 
     logger.info(
-        "[kalshi.ingest] DEV_MODE sync complete: %d events, %d markets upserted, "
-        "%d open market tickers in subscription list",
+        "[kalshi.ingest] DEV_MODE sync complete: %d explicit series, "
+        "%d events, %d markets upserted, %d open market tickers in subscription list",
+        len(target_series_tickers),
         total_events, total_markets, len(new_target_markets),
     )
 

@@ -135,11 +135,11 @@ DEV_MODE=False (production):
   _redis_flusher() → drain in 100ms/500-item batches → pipeline HSET
   Phase 2: asyncio.create_task(_flush_candles()) → batch candle EVAL (fire-and-forget, dedup per market)
 
-DEV_MODE=True (sandbox — free-tier Redis Cloud ≤100 ops/sec):
-  Subscribe: {"channels": [...], "market_tickers": [...DEV_TARGET_MARKETS]}
-  WS receive loop → _dev_enqueue_ticker() → _latest_ticks[market_id] = update (dict overwrite)
-  _dev_redis_flusher() → await asyncio.sleep(1.5) → snapshot+clear _latest_ticks → pipeline HSET+EVAL
-  Max ~60–90 ops/sec (N markets × 2 HSET + N EVAL per 1.5s — always under 100 ops/sec limit)
+DEV_MODE=True (Railway Pro — no ops/sec constraint):
+  Subscribe: {"channels": [...], "market_tickers": [...DEV_TARGET_MARKETS]} (filtered to explicit 11 series)
+  WS receive loop → _enqueue_ticker() → asyncio.Queue(maxsize=100_000) (same as production)
+  _redis_flusher() → drain in 100ms/500-item batches → pipeline HSET (same as production)
+  Scope is limited via WS filter (DEV_TARGET_MARKETS), not via debouncing
 
 Lifecycle events (both modes):
   market_lifecycle_v2 → asyncio.create_task(_handle_market_lifecycle(msg))
@@ -254,6 +254,11 @@ Key design decisions:
 - All tables use soft deletes (`is_deleted`) — never hard-delete market data
 - `market_outcomes.execution_asset_id` = Kalshi `"yes"/"no"` or Polymarket ERC-1155 token ID
 
+Frontend display columns (added to avoid JSONB parsing on the FE):
+- `series.settlement_sources` (JSONB), `series.contract_url`, `series.additional_prohibitions` (JSONB)
+- `events.sub_title`, `events.featured_image_url`, `events.settlement_sources` (JSONB), `events.competition`, `events.competition_scope`
+- `markets.yes_sub_title`, `markets.no_sub_title`, `markets.image_url`, `markets.color_code`, `markets.open_interest`, `markets.volume`
+
 Full SQL schema is in `/schema.sql`. ORM models live in `app/models/db.py`.
 
 ---
@@ -357,28 +362,29 @@ Full SQL schema is in `/schema.sql`. ORM models live in `app/models/db.py`.
 - **None price fallback**: Kalshi `price.open/high/low/close` fields are `None` when no actual trades occurred in a period. Fall back to `(yes_bid.open + yes_ask.open) / 2` midpoint. Never skip periods — fall through to the bid/ask midpoint check.
 - **market_ticker is required for live candle**: The candlestick endpoint accepts optional `market_ticker` query param. Without it, `market_tickers=[]` and the live Redis candle is not fetched — only historical data is returned.
 
-### DEV_MODE — Free-Tier Infrastructure Sandbox
+### DEV_MODE — Railway Pro Sandbox
 
 **When DEV_MODE=True:**
-- **Scope**: Only 3 series tracked: `KXHIGHNY` (Weather), `KXCPI` (Economics), `KXNBAPLAYOFF` (Sports)
-- **Dev config**: `app/core/dev_config.py` defines `DEV_TARGET_SERIES` (static list) and `DEV_TARGET_MARKETS` (mutable list, `.clear()` + `.extend()` at startup)
-- **Startup flow**: `run_kalshi_dev_sync()` runs before WS connects → syncs 3 series → fetches `status="open"` events only (fast: ~10s) → builds `DEV_TARGET_MARKETS` list → WS subscribes to those markets only
-- **WebSocket**: `_dev_enqueue_ticker()` writes to `_latest_ticks` dict (overwrites, no queue needed); `_dev_redis_flusher()` sleeps 1.5s then snapshots/clears dict and flushes via single pipeline — guarantees ≤60 Redis ops/sec
+- **Scope**: Explicit curated series list — 11 tickers across 4 categories defined in `app/core/dev_config.py::DEV_EXPLICIT_SERIES`. Each series tests a specific UI/data edge case.
+- **Dev config**: `app/core/dev_config.py` defines `DEV_EXPLICIT_SERIES` (dict of category → tickers), `DEV_EXPLICIT_SERIES_FLAT` (flat list), `DEV_REDIS_FLUSH_INTERVAL` (0.5s), and mutable lists `DEV_TARGET_SERIES` + `DEV_TARGET_MARKETS` (populated dynamically at startup)
+- **Startup flow**: `run_kalshi_dev_sync()` runs before WS connects → fetches all series from Kalshi, filters to `DEV_EXPLICIT_SERIES_FLAT` → upserts selected series → fetches `status="open"` events only → fetches event metadata (images, colors, settlement sources) → builds `DEV_TARGET_MARKETS` list → WS subscribes to those markets only
+- **Event metadata**: During dev sync, `get_event_metadata()` is called per event to fetch display data (image_url, featured_image_url, market-level image_url/color_code, settlement_sources, competition info)
+- **WebSocket**: Same production micro-batching flusher (`_enqueue_ticker` + asyncio.Queue + 100ms drain) — scope limited by filtered WS subscription, not debouncing
 - **Subscribe message**: `{"id": 1, "cmd": "subscribe", "params": {"channels": ["ticker", "market_lifecycle_v2"], "market_tickers": [...DEV_TARGET_MARKETS]}}`
 - **arq crons**: All cron jobs disabled (`WorkerSettings.cron_jobs = []`) — manually trigger via `POST /api/v1/dev/sync-kalshi`
 - **Dev endpoint**: `app/api/routes/v1/dev.py::POST /api/v1/dev/sync-kalshi` — calls `run_kalshi_dev_sync()`, returns `{"status": "ok", "target_markets_count": N}`, returns 403 if DEV_MODE=False
-- **Redis ops budget**: pipeline commands count individually toward limit. Never use `asyncio.gather` for concurrent EVAL calls — causes "max number of clients reached" on Redis Cloud. Always pipeline.
+
+**Explicit DEV series (11 tickers across 4 categories):**
+- Politics: `KXNEXTIRANLEADER`, `KXDHSFUND`, `KXLOSEREELECTIONGOV`
+- Economics: `KXFEDDECISION`, `KXINXY`, `KXISMPMI`
+- Tech/Corporate: `KXIPO`, `KXGAMEAWARDS`
+- Climate/Mentions: `KXNYTHEAD`, `KXHMONTH`, `KXWARMING`
 
 **When DEV_MODE=False (production):**
 - Global firehose subscription (no `market_tickers` filter)
 - Production micro-batching: asyncio.Queue + 100ms/500-item flusher
 - All arq crons enabled
 - `POST /api/v1/dev/sync-kalshi` returns HTTP 403
-
-**Critical for free-tier Redis Cloud:**
-- Pipeline commands are each counted separately toward ops/sec limit
-- `asyncio.gather` for concurrent EVAL calls causes "max number of clients reached" — always use pipeline instead
-- In dev mode, even a single missed debounce cycle is safe because the flusher resets every 1.5s
 
 ---
 

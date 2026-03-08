@@ -154,6 +154,20 @@ class Series(Base):
     tags = Column(JSONB, default=list)              # Array of tag strings
     image_url = Column(Text)
     frequency = Column(Text)                        # Kalshi: "daily", "weekly", "2y", etc.
+
+    # Settlement & contract info (from Kalshi Series API)
+    settlement_sources = Column(JSONB, default=list)    # [{name, url}, ...]
+    contract_url = Column(Text)                         # Link to original contract filing
+    additional_prohibitions = Column(JSONB, default=list)  # ["No trading if...", ...]
+
+    # Fee structure
+    fee_type = Column(String(50))
+    fee_multiplier = Column(Numeric(10, 4))
+
+    # Aggregated volume metrics
+    volume_24h = Column(Numeric(24, 8), default=0)
+    total_volume = Column(Numeric(24, 8), default=0)
+
     is_deleted = Column(Boolean, default=False)
     created_at = Column(DateTime(timezone=True), server_default=text("NOW()"))
     updated_at = Column(DateTime(timezone=True), server_default=text("NOW()"), onupdate=lambda: datetime.now(timezone.utc))
@@ -178,15 +192,28 @@ class Event(Base):
     exchange = Column(exchange_enum, nullable=False)
     ext_id = Column(Text, nullable=False)           # Kalshi event_ticker | Polymarket slug
     title = Column(Text, nullable=False)
-    description = Column(Text)
+    description = Column(Text)                       # Maps to Kalshi sub_title
+    sub_title = Column(Text)                         # Short descriptive title
     category = Column(Text)
     status = Column(market_status_enum, default="active")
     mutually_exclusive = Column(Boolean, default=False)
     close_time = Column(DateTime(timezone=True))
     expected_expiration_time = Column(DateTime(timezone=True))
     volume_24h = Column(Numeric(24, 8), default=0)
-    image_url = Column(Text)
-    platform_metadata = Column(JSONB, default=dict)  # Neg Risk flags, MVP grouping rules, etc.
+
+    # Display metadata (from Kalshi event metadata endpoint)
+    event_image_url = Column(Text)                   # Event-level image (from metadata endpoint)
+    image_url = Column(Text)                         # Event-level image (legacy/product_metadata)
+    featured_image_url = Column(Text)                # Featured market image
+    settlement_sources = Column(JSONB, default=list) # [{name, url}, ...]
+    competition = Column(String(100))                # Sports competition name
+    competition_scope = Column(String(100))          # Competition scope
+
+    # Aggregated volume/interest metrics
+    total_volume = Column(Numeric(24, 8), default=0)
+    open_interest = Column(Numeric(24, 8), default=0)
+
+    platform_metadata = Column(JSONB, default=dict)  # Neg Risk flags, product_metadata, etc.
     is_deleted = Column(Boolean, default=False)
     created_at = Column(DateTime(timezone=True), server_default=text("NOW()"))
     updated_at = Column(DateTime(timezone=True), server_default=text("NOW()"), onupdate=lambda: datetime.now(timezone.utc))
@@ -219,6 +246,8 @@ class Market(Base):
     ext_id = Column(Text, nullable=False)           # Kalshi ticker | Polymarket conditionId
     title = Column(Text, nullable=False)
     subtitle = Column(Text)
+    yes_sub_title = Column(Text)                    # Shortened title for YES side
+    no_sub_title = Column(Text)                     # Shortened title for NO side
     type = Column(market_type_enum, default="binary")
     status = Column(market_status_enum, default="unopened")
     open_time = Column(DateTime(timezone=True))
@@ -229,6 +258,22 @@ class Market(Base):
     result = Column(Text)                           # Final resolved value ("yes", "no", named outcome)
     rules_primary = Column(Text)
     rules_secondary = Column(Text)
+
+    # Display metadata (from Kalshi event metadata endpoint)
+    image_url = Column(Text)                        # Market-specific image
+    color_code = Column(String(10))                 # Hex color for UI display
+
+    # Kalshi fractional trading / fixed-point migration fields
+    fractional_trading_enabled = Column(Boolean, default=False)
+    response_price_units = Column(String(50))       # e.g. "usd_cent"
+    strike_type = Column(String(50))                # e.g. "greater", "less", "between"
+
+    # Trading metrics
+    open_interest = Column(Numeric(24, 8))          # Number of open contracts
+    volume = Column(Numeric(24, 8))                 # Total contracts traded (all-time)
+    volume_24h = Column(Numeric(24, 8), default=0)  # Rolling 24h volume
+    total_volume = Column(Numeric(24, 8), default=0) # Alias for total notional volume
+    liquidity = Column(Numeric(24, 8), default=0)   # Current orderbook liquidity
 
     # Exchange-specific overflow: CTF condition IDs, Kalshi custom strikes, Neg Risk config, etc.
     platform_metadata = Column(JSONB, default=dict)

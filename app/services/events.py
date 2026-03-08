@@ -8,6 +8,7 @@ joining, and merging live ticker data from Redis.
 from typing import Optional
 from uuid import UUID
 
+import redis.asyncio as aioredis
 from sqlalchemy import distinct, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload, joinedload
@@ -228,3 +229,59 @@ async def get_event_detail(
         "image_url": event.image_url,
         "markets": market_details,
     }
+
+
+async def get_trending_events(
+    redis_conn: aioredis.Redis,
+    db: AsyncSession,
+    limit: int = 20,
+) -> list[dict]:
+    """
+    Fetch trending events by reading the events_trending_24h Redis ZSET
+    (maintained by the WebSocket flusher) and hydrating from Postgres.
+
+    Returns event dicts ordered by descending 24h volume.
+    """
+    # ZREVRANGE returns members sorted by score descending (highest volume first)
+    trending_ext_ids = await redis_conn.zrevrange(
+        "events_trending_24h", 0, limit - 1, withscores=True,
+    )
+
+    if not trending_ext_ids:
+        return []
+
+    # trending_ext_ids is list of (member, score) tuples
+    ext_id_list = [member for member, _score in trending_ext_ids]
+    score_map = {member: score for member, score in trending_ext_ids}
+
+    # Point lookup in Postgres
+    result = await db.execute(
+        select(Event)
+        .where(
+            Event.ext_id.in_(ext_id_list),
+            Event.is_deleted == False,
+        )
+    )
+    events_by_ext = {e.ext_id: e for e in result.scalars().all()}
+
+    # Build response preserving ZSET order
+    items = []
+    for ext_id in ext_id_list:
+        e = events_by_ext.get(ext_id)
+        if e is None:
+            continue
+        items.append({
+            "id": e.id,
+            "ext_id": e.ext_id,
+            "title": e.title,
+            "category": e.category,
+            "status": e.status,
+            "close_time": e.close_time,
+            "volume_24h": score_map.get(ext_id, 0),
+            "image_url": e.image_url,
+            "event_image_url": e.event_image_url,
+            "featured_image_url": e.featured_image_url,
+            "competition": e.competition,
+        })
+
+    return items

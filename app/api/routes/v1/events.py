@@ -110,6 +110,27 @@ class EventDetailResponse(BaseModel):
     markets: list[MarketDetail] = []
 
 
+class TrendingEventItem(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    ext_id: str
+    title: str
+    category: Optional[str] = None
+    status: Optional[str] = None
+    close_time: Optional[datetime] = None
+    volume_24h: Optional[float] = None
+    image_url: Optional[str] = None
+    event_image_url: Optional[str] = None
+    featured_image_url: Optional[str] = None
+    competition: Optional[str] = None
+
+
+class TrendingEventsResponse(BaseModel):
+    events: list[TrendingEventItem]
+    count: int
+
+
 class CategoryListResponse(BaseModel):
     categories: list[str]
     count: int
@@ -118,6 +139,17 @@ class CategoryListResponse(BaseModel):
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
+
+@router.get("/events/trending", response_model=TrendingEventsResponse)
+async def get_trending_events(
+    limit: int = Query(default=20, ge=1, le=100, description="Number of trending events"),
+    db: AsyncSession = Depends(get_db),
+) -> TrendingEventsResponse:
+    """Trending events ranked by rolling 24h volume from Redis ZSET leaderboard."""
+    redis = await get_redis()
+    items = await event_service.get_trending_events(redis, db, limit=limit)
+    return TrendingEventsResponse(events=items, count=len(items))
+
 
 @router.get("/{exchange}/categories", response_model=CategoryListResponse)
 async def list_categories(

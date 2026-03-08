@@ -14,9 +14,9 @@ from __future__ import annotations
 
 from datetime import datetime
 from decimal import Decimal
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field
 
 
 # ---------------------------------------------------------------------------
@@ -30,6 +30,13 @@ KALSHI_STATUS_MAP: dict[str, str] = {
     "paused": "suspended",
     "finalized": "resolved",
     "unopened": "unopened",
+    # SDK Market model uses these statuses:
+    "initialized": "unopened",
+    "inactive": "unopened",
+    "active": "active",
+    "determined": "resolved",
+    "disputed": "in_dispute",
+    "amended": "resolved",
 }
 
 
@@ -40,7 +47,7 @@ def map_kalshi_status(raw: str | None) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Series
+# Settlement Source (shared across series/events)
 # ---------------------------------------------------------------------------
 
 class KalshiSettlementSource(BaseModel):
@@ -50,9 +57,16 @@ class KalshiSettlementSource(BaseModel):
     url: Optional[str] = None
 
 
+# ---------------------------------------------------------------------------
+# Series
+# ---------------------------------------------------------------------------
+
 class KalshiSeries(BaseModel):
     """
     Returned by GET /trade-api/v2/series and GET /trade-api/v2/series/{series_ticker}.
+
+    Fields match the SDK's Series model. image_url and description are NOT
+    top-level API fields — they may live inside product_metadata.
     """
     model_config = ConfigDict(extra="ignore")
 
@@ -60,10 +74,31 @@ class KalshiSeries(BaseModel):
     title: str
     category: Optional[str] = None
     tags: Optional[List[str]] = Field(default_factory=list)
-    image_url: Optional[str] = None
-    description: Optional[str] = None
     frequency: Optional[str] = None
     settlement_sources: Optional[List[KalshiSettlementSource]] = Field(default_factory=list)
+    contract_url: Optional[str] = None
+    contract_terms_url: Optional[str] = None
+    product_metadata: Optional[Dict[str, Any]] = None
+    fee_type: Optional[str] = None
+    fee_multiplier: Optional[float] = None
+    additional_prohibitions: Optional[List[str]] = Field(default_factory=list)
+    volume: Optional[int] = None
+    volume_fp: Optional[str] = None
+    last_updated_ts: Optional[datetime] = None
+
+    @property
+    def image_url(self) -> Optional[str]:
+        """Extract image_url from product_metadata if present."""
+        if self.product_metadata and "image_url" in self.product_metadata:
+            return self.product_metadata["image_url"]
+        return None
+
+    @property
+    def description(self) -> Optional[str]:
+        """Extract description from product_metadata if present."""
+        if self.product_metadata and "description" in self.product_metadata:
+            return self.product_metadata["description"]
+        return None
 
 
 class KalshiSeriesListResponse(BaseModel):
@@ -87,6 +122,7 @@ class KalshiEvent(BaseModel):
     series_ticker: Optional[str] = None
     sub_title: Optional[str] = None
     title: str
+    collateral_return_type: Optional[str] = None
     mutually_exclusive: Optional[bool] = False
     category: Optional[str] = None
     status: Optional[str] = None
@@ -94,6 +130,9 @@ class KalshiEvent(BaseModel):
     strike_period: Optional[str] = None
     close_time: Optional[datetime] = None
     expected_expiration_time: Optional[datetime] = None
+    available_on_brokers: Optional[bool] = None
+    product_metadata: Optional[Dict[str, Any]] = None
+    last_updated_ts: Optional[datetime] = None
     settlement_sources: Optional[List[KalshiSettlementSource]] = Field(default_factory=list)
     markets: Optional[List["KalshiMarket"]] = Field(default_factory=list)
 
@@ -107,6 +146,31 @@ class KalshiEventListResponse(BaseModel):
 
     events: List[KalshiEvent] = Field(default_factory=list)
     cursor: Optional[str] = None
+
+
+# ---------------------------------------------------------------------------
+# Event Metadata (from GET /events/{ticker}/metadata)
+# ---------------------------------------------------------------------------
+
+class KalshiMarketMetadata(BaseModel):
+    """Per-market display metadata from the event metadata endpoint."""
+    model_config = ConfigDict(extra="ignore")
+
+    market_ticker: str
+    image_url: Optional[str] = None
+    color_code: Optional[str] = None
+
+
+class KalshiEventMetadata(BaseModel):
+    """Response from GET /trade-api/v2/events/{event_ticker}/metadata."""
+    model_config = ConfigDict(extra="ignore")
+
+    image_url: Optional[str] = None
+    featured_image_url: Optional[str] = None
+    market_details: Optional[List[KalshiMarketMetadata]] = Field(default_factory=list)
+    settlement_sources: Optional[List[KalshiSettlementSource]] = Field(default_factory=list)
+    competition: Optional[str] = None
+    competition_scope: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -125,13 +189,16 @@ class KalshiMarket(BaseModel):
     ticker: str
     event_ticker: Optional[str] = None
     series_ticker: Optional[str] = None
-    market_type: Optional[str] = "binary"     # "binary", "categorical", "scalar"
+    market_type: Optional[str] = "binary"     # "binary", "scalar"
     title: str
     subtitle: Optional[str] = None
+    yes_sub_title: Optional[str] = None
+    no_sub_title: Optional[str] = None
     open_time: Optional[datetime] = None
     close_time: Optional[datetime] = None
     expiration_time: Optional[datetime] = None
     latest_expiration_time: Optional[datetime] = None
+    expected_expiration_time: Optional[datetime] = None
     settlement_timer_seconds: Optional[int] = None
     status: Optional[str] = None
     response_price_units: Optional[str] = None  # "usd_cent"
@@ -146,21 +213,41 @@ class KalshiMarket(BaseModel):
     previous_yes_ask: Optional[int] = None
     previous_price: Optional[int] = None
 
+    # Dollar string prices (new SDK format)
+    yes_bid_dollars: Optional[str] = None
+    yes_ask_dollars: Optional[str] = None
+    no_bid_dollars: Optional[str] = None
+    no_ask_dollars: Optional[str] = None
+    last_price_dollars: Optional[str] = None
+
     volume: Optional[int] = None
     volume_24h: Optional[int] = None
     liquidity: Optional[int] = None
     open_interest: Optional[int] = None
+    open_interest_fp: Optional[str] = None
+    notional_value: Optional[int] = None
     risk_limit_cents: Optional[int] = None
+    fractional_trading_enabled: Optional[bool] = None
 
     can_close_early: Optional[bool] = None
+    early_close_condition: Optional[str] = None
     expiration_value: Optional[str] = None
     category: Optional[str] = None
     strike_type: Optional[str] = None
     floor_strike: Optional[Any] = None
     cap_strike: Optional[Any] = None
+    functional_strike: Optional[str] = None
+    custom_strike: Optional[Dict[str, Any]] = None
     rules_primary: Optional[str] = None
     rules_secondary: Optional[str] = None
     result: Optional[str] = None               # Resolved value: "yes", "no", or named outcome
+
+    settlement_value: Optional[int] = None
+    settlement_value_dollars: Optional[str] = None
+    settlement_ts: Optional[datetime] = None
+
+    price_level_structure: Optional[str] = None
+    is_provisional: Optional[bool] = None
 
     @property
     def normalized_status(self) -> str:
