@@ -825,7 +825,6 @@ async def run_kalshi_full_sync() -> None:
 # DEV_MODE: restricted sync for sandbox / free-tier environments
 # ---------------------------------------------------------------------------
 
-
 async def _upsert_single_series(pool, s, now: datetime) -> None:
     """Upsert a single series row (used in dev sync for individual series)."""
     settlement_sources = [
