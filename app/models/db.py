@@ -140,17 +140,22 @@ class TrackedEntity(Base):
 class Series(Base):
     """
     Top-level market category.
-    Kalshi: series_ticker (e.g., "KXINAUGURATE")
-    Polymarket: slug or UUID
+    Kalshi:     ext_id = series_ticker (e.g. "KXINAUGURATE"); no slug concept
+    Polymarket: ext_id = Gamma series id (stable UUID/int);
+                slug stored in platform_metadata["slug"] for UI sharing/linking
     """
     __tablename__ = "series"
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     exchange = Column(exchange_enum, nullable=False)
-    ext_id = Column(Text, nullable=False)           # Kalshi series_ticker | Polymarket slug
+    ext_id = Column(Text, nullable=False)           # Kalshi ticker | Polymarket series id
     title = Column(Text, nullable=False)
     description = Column(Text)
-    category = Column(Text)
+    # JSONB list of category labels — e.g. ["Politics", "Elections"]
+    # Kalshi: single-element list wrapping the string category from the API
+    # Polymarket: multi-element list from the series "categories" array
+    # NOTE: requires a DB migration to change from TEXT to JSONB if upgrading existing schema
+    category = Column(JSONB, default=list)
     tags = Column(JSONB, default=list)              # Array of tag strings
     image_url = Column(Text)
     frequency = Column(Text)                        # Kalshi: "daily", "weekly", "2y", etc.
@@ -159,6 +164,10 @@ class Series(Base):
     settlement_sources = Column(JSONB, default=list)    # [{name, url}, ...]
     contract_url = Column(Text)                         # Link to original contract filing
     additional_prohibitions = Column(JSONB, default=list)  # ["No trading if...", ...]
+
+    # Exchange-specific overflow: Polymarket slug/ticker, Kalshi contract URLs, etc.
+    # Polymarket: {"slug": "trump-approval-positve", "ticker": "APPROVAL"}
+    platform_metadata = Column(JSONB, default=dict)
 
     # Fee structure
     fee_type = Column(String(50))
@@ -182,15 +191,16 @@ class Series(Base):
 class Event(Base):
     """
     A specific resolution scope within a series.
-    Kalshi: event_ticker (e.g., "KXINAUGURATE-25JAN20")
-    Polymarket: slug
+    Kalshi:     ext_id = event_ticker (e.g. "KXINAUGURATE-25JAN20"); no slug concept
+    Polymarket: ext_id = Gamma event id (stable string);
+                slug stored in platform_metadata["slug"] for UI sharing/linking
     """
     __tablename__ = "events"
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     series_id = Column(UUID(as_uuid=True), ForeignKey("series.id", ondelete="SET NULL"), nullable=True)
     exchange = Column(exchange_enum, nullable=False)
-    ext_id = Column(Text, nullable=False)           # Kalshi event_ticker | Polymarket slug
+    ext_id = Column(Text, nullable=False)           # Kalshi event_ticker | Polymarket event id
     title = Column(Text, nullable=False)
     description = Column(Text)                       # Maps to Kalshi sub_title
     sub_title = Column(Text)                         # Short descriptive title
@@ -235,8 +245,9 @@ class Event(Base):
 class Market(Base):
     """
     A single tradeable contract within an event.
-    Kalshi: specific ticker (e.g., "KXINAUGURATE-25JAN20-B0.5")
-    Polymarket: conditionId or UUID
+    Kalshi:     ext_id = specific ticker (e.g. "KXINAUGURATE-25JAN20-B0.5"); no slug concept
+    Polymarket: ext_id = conditionId (stable hex string);
+                market_slug stored in platform_metadata["market_slug"] for UI sharing/linking
     """
     __tablename__ = "markets"
 

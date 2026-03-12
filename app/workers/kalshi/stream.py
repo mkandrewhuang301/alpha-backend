@@ -272,7 +272,7 @@ async def _redis_flusher(redis_conn) -> None:
             if event_volumes:
                 pipe2 = redis_conn.pipeline(transaction=False)
                 for evt, vol in event_volumes.items():
-                    pipe2.zadd("events_trending_24h", {evt: vol})
+                    pipe2.zadd("events_trending_24h_kalshi", {evt: vol})
                 await pipe2.execute()
 
             logger.debug(

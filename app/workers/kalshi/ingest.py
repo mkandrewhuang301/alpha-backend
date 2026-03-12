@@ -118,7 +118,7 @@ async def sync_series() -> int:
             s.ticker,                                  # ext_id
             s.title,                                   # title
             s.description,                             # description (from product_metadata)
-            s.category,                                # category
+            _json.dumps([s.category] if s.category else []),  # category (JSONB list)
             _json.dumps(s.tags or []),                  # tags (JSONB)
             s.image_url,                               # image_url (from product_metadata)
             s.frequency,                               # frequency
@@ -149,7 +149,7 @@ async def sync_series() -> int:
                                        image_url, frequency, settlement_sources, contract_url,
                                        additional_prohibitions, fee_type, fee_multiplier,
                                        volume_24h, total_volume, is_deleted, updated_at)
-                    VALUES ($1::uuid, $2, $3, $4, $5, $6, $7::jsonb, $8, $9,
+                    VALUES ($1::uuid, $2, $3, $4, $5, $6::jsonb, $7::jsonb, $8, $9,
                             $10::jsonb, $11, $12::jsonb, $13, $14::numeric,
                             $15::numeric, $16::numeric, $17, $18)
                     ON CONFLICT ON CONSTRAINT uq_series_exchange_extid DO UPDATE SET

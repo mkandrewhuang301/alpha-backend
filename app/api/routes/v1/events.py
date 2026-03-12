@@ -140,14 +140,15 @@ class CategoryListResponse(BaseModel):
 # Routes
 # ---------------------------------------------------------------------------
 
-@router.get("/events/trending", response_model=TrendingEventsResponse)
+@router.get("/{exchange}/events/trending", response_model=TrendingEventsResponse)
 async def get_trending_events(
+    exchange: str = Path(description="Exchange name: 'kalshi' or 'polymarket'"),
     limit: int = Query(default=20, ge=1, le=100, description="Number of trending events"),
     db: AsyncSession = Depends(get_db),
 ) -> TrendingEventsResponse:
-    """Trending events ranked by rolling 24h volume from Redis ZSET leaderboard."""
+    """Trending events ranked by rolling 24h volume from the exchange-specific Redis ZSET leaderboard."""
     redis = await get_redis()
-    items = await event_service.get_trending_events(redis, db, limit=limit)
+    items = await event_service.get_trending_events(redis, db, exchange=exchange, limit=limit)
     return TrendingEventsResponse(events=items, count=len(items))
 
 

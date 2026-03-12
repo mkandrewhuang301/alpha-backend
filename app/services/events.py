@@ -234,17 +234,20 @@ async def get_event_detail(
 async def get_trending_events(
     redis_conn: aioredis.Redis,
     db: AsyncSession,
+    exchange: str,
     limit: int = 20,
 ) -> list[dict]:
     """
-    Fetch trending events by reading the events_trending_24h Redis ZSET
-    (maintained by the WebSocket flusher) and hydrating from Postgres.
+    Fetch trending events by reading the exchange-specific events_trending_24h_{exchange}
+    Redis ZSET (maintained by each exchange's WebSocket flusher) and hydrating from Postgres.
 
-    Returns event dicts ordered by descending 24h volume.
+    Returns event dicts ordered by descending 24h volume, filtered to the given exchange.
     """
+    zset_key = f"events_trending_24h_{exchange}"
+
     # ZREVRANGE returns members sorted by score descending (highest volume first)
     trending_ext_ids = await redis_conn.zrevrange(
-        "events_trending_24h", 0, limit - 1, withscores=True,
+        zset_key, 0, limit - 1, withscores=True,
     )
 
     if not trending_ext_ids:
@@ -254,11 +257,12 @@ async def get_trending_events(
     ext_id_list = [member for member, _score in trending_ext_ids]
     score_map = {member: score for member, score in trending_ext_ids}
 
-    # Point lookup in Postgres
+    # Point lookup in Postgres — filter by exchange for correctness
     result = await db.execute(
         select(Event)
         .where(
             Event.ext_id.in_(ext_id_list),
+            Event.exchange == exchange,
             Event.is_deleted == False,
         )
     )

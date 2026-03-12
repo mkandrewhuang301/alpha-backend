@@ -60,3 +60,40 @@ DEV_REDIS_FLUSH_INTERVAL: float = 0.5
 # Mutable lists — workers write to them via .clear() + .extend().
 DEV_TARGET_SERIES: List[str] = []
 DEV_TARGET_MARKETS: List[str] = []
+
+# ---------------------------------------------------------------------------
+# Polymarket DEV_MODE targets
+# ---------------------------------------------------------------------------
+# Curated Polymarket SERIES slugs to sync in DEV_MODE.
+# These are fetched from the Gamma API /series?slug={slug} endpoint.
+# Each series contains multiple events (recurring polls / milestones).
+#
+# Chosen to cover multi-event recurring series across Politics, Economics, and Crypto:
+#   Politics:  US government / elections series (ongoing, multi-event)
+#   Economics: Federal Reserve rate decisions (recurring monthly events)
+#   Crypto:    Bitcoin / Ethereum price series (high-volume, always-active)
+#
+# Verified against live Gamma API (GET https://gamma-api.polymarket.com/series?active=true).
+# Chosen to cover different market types and categories:
+#   Politics:    Trump approval ratings (binary, recurring)
+#   Economics:   US annual inflation + ECB interest rates (recurring monthly)
+#   Crypto:      Solana monthly price (multi-strike, scalar ranges)
+#   Culture:     Billboard #1 song (categorical, multiple-choice)
+POLYMARKET_DEV_SERIES_SLUGS: List[str] = [
+    # Politics — binary approval rating (2–4 events, clean binary market)
+    "trump-approval-positve",
+    "trump-negative-approval",
+    # Economics — recurring monthly data series
+    "us-annual-inflation",
+    "unemployment",
+    # Crypto — price range markets
+    "solana-hit-price-monthly",
+]
+
+# Populated dynamically at startup by run_polymarket_dev_sync().
+# Contains the ERC-1155 token IDs collected from the Gamma API ingest.
+# The CLOB WebSocket stream uses these to subscribe to live price feeds.
+POLYMARKET_DEV_TOKEN_IDS: List[str] = []
+
+# Polymarket event ext_ids (Gamma API event IDs) — used for trending ZSET seeding.
+POLYMARKET_DEV_EVENT_IDS: List[str] = []

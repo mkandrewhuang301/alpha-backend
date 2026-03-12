@@ -43,6 +43,65 @@ def map_polymarket_status(raw: str | None) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Series (Gamma API /series endpoint)
+# ---------------------------------------------------------------------------
+
+class PolymarketCategory(BaseModel):
+    """A category label from the Gamma /series categories array."""
+    model_config = ConfigDict(extra="ignore")
+
+    id: Optional[Any] = None
+    label: Optional[str] = None
+
+    @property
+    def label_str(self) -> str:
+        """Return label string, falling back to str(id) if label is missing."""
+        return self.label or str(self.id or "")
+
+
+class PolymarketSeries(BaseModel):
+    """
+    A Polymarket series from the Gamma API /series endpoint.
+    Maps to our series table.
+
+    Identifier strategy:
+        ext_id          = series.id      (stable internal ID for background polling)
+        platform_metadata["slug"] = series.slug (URL-friendly for FE sharing/linking)
+        platform_metadata["ticker"] = series.ticker (short machine-readable key)
+    """
+    model_config = ConfigDict(extra="ignore")
+
+    id: str                                         # Used as ext_id in series table
+    slug: Optional[str] = None                      # URL-friendly — stored in platform_metadata
+    ticker: Optional[str] = None                    # Short key — stored in platform_metadata
+    title: str
+    description: Optional[str] = None
+    categories: Optional[List[PolymarketCategory]] = Field(default_factory=list)
+    tags: Optional[List[str]] = Field(default_factory=list)
+    image: Optional[str] = None                     # Featured image URL
+    icon: Optional[str] = None                      # Small icon URL
+    active: Optional[bool] = None
+    closed: Optional[bool] = None
+    archived: Optional[bool] = None
+    featured: Optional[bool] = None
+    recurrence: Optional[str] = None               # "weekly", "daily", "monthly" → frequency
+    volume24hr: Optional[Decimal] = None
+    volume: Optional[Decimal] = None
+    liquidity: Optional[Decimal] = None
+    start_date: Optional[str] = Field(default=None, alias="startDate")
+    events: Optional[List[Any]] = Field(default_factory=list)
+
+    @property
+    def category_labels(self) -> List[str]:
+        """Extract category labels as a plain string list for DB storage."""
+        return [c.label_str for c in (self.categories or []) if c.label_str]
+
+    @property
+    def image_url(self) -> Optional[str]:
+        return self.image or self.icon
+
+
+# ---------------------------------------------------------------------------
 # Markets (Gamma API metadata layer)
 # ---------------------------------------------------------------------------
 
