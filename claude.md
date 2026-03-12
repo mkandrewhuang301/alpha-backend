@@ -122,7 +122,7 @@ arq cron  ──► kalshi_full_sync (15m, prod only) ──► PostgreSQL (full
 arq cron  ──► state_reconciliation (1m, prod only) ──► PostgreSQL (delta via min_updated_ts filter)
 arq cron  ──► aggregate_event_volumes (5m, prod only) ──► PostgreSQL (events.volume_24h from market metadata)
 arq cron  ──► aggregate_ohlcv (1m, prod only) ──► PostgreSQL market_ticks (tick snapshots from Redis)
-POST /api/v1/dev/sync-kalshi ──► run_kalshi_dev_sync() ──► PostgreSQL (dev mode manual trigger)
+POST /api/v1/dev/sync/{exchange} ──► run_{exchange}_dev_sync() ──► PostgreSQL (dev mode manual trigger)
 Kalshi REST ──► historical candlesticks (on-demand per API request)
 PostgreSQL + Redis ──► FastAPI routes ──► iOS app
 ```
@@ -192,7 +192,8 @@ alpha-backend/
 │   │       ├── v1/                  # Versioned endpoints (DB + Redis live data)
 │   │       │   ├── events.py        # /api/v1/{exchange}/events — live prices merged
 │   │       │   ├── candlesticks.py  # /api/v1/kalshi/events/{ticker}/candlesticks — hybrid OHLCV
-│   │       │   └── dev.py           # /api/v1/dev/sync-kalshi — manual sync (DEV_MODE only, returns 403 in prod)
+│   │       │   └── dev.py           # /api/v1/dev/sync/{exchange} — manual sync (DEV_MODE only, returns 403 in prod)
+│   │       ├── categories.py        # /categories — legacy Category table + /platform-tags — PlatformTag UI taxonomy
 │   │       ├── sports.py            # Injuries, lineups, stats, weather, refs (planned)
 │   │       ├── traders.py           # Sharp trader leaderboard, profiles (planned)
 │   │       ├── users.py             # Auth, positions, portfolio (planned)
@@ -215,6 +216,10 @@ alpha-backend/
 │   │   ├── kalshi/
 │   │   │   ├── ingest.py            # Syncs series/events/markets/outcomes + OHLCV aggregation
 │   │   │   └── stream.py            # WebSocket firehose: ticker → Redis + live candles, lifecycle → Postgres
+│   │   ├── polymarket/
+│   │   │   ├── ingest.py            # Gamma API sync: series/events/markets/outcomes; array taxonomy categories/tags
+│   │   │   └── stream.py            # CLOB WS: book/price_change → Redis HSET, ZADD trending ZSET
+│   │   ├── taxonomy.py              # upsert_platform_tag(), slugify() — shared taxonomy helpers
 │   │   ├── injury_monitor.py        # Polls injury reports every 5 min
 │   │   ├── lineup_monitor.py        # Watches lineup releases
 │   │   ├── market_monitor.py        # Watches line movement and volume spikes
@@ -253,6 +258,10 @@ Key design decisions:
 - `platform_metadata JSONB` absorbs exchange-specific fields (Kalshi CTF IDs, Neg Risk flags, etc.) without schema changes
 - All tables use soft deletes (`is_deleted`) — never hard-delete market data
 - `market_outcomes.execution_asset_id` = Kalshi `"yes"/"no"` or Polymarket ERC-1155 token ID
+- **Array taxonomy**: `series.categories`, `series.tags`, `events.categories`, `events.tags` are all `ARRAY(text)` slug strings with GIN indexes — O(1) `@>` containment filtering
+- **series_ids**: `events.series_ids` is `ARRAY(UUID)` replacing old `series_id` FK — supports Polymarket many-to-many events↔series. Filter via `array_position(series_ids, $uuid)` in SQLAlchemy.
+- **PlatformTag**: `platform_tags` table (exchange, type=category|tag, slug, label, image_url, is_carousel, force_show) — UI metadata for the category/tag taxonomy displayed in the frontend. Slug matches ARRAY values in events/series.
+- **Taxonomy slugify rule**: `slugify(str)` normalizes any string to URL-safe slug (lowercase, hyphens, no special chars). All ARRAY taxonomy values use slugified strings.
 
 Frontend display columns (added to avoid JSONB parsing on the FE):
 - `series.settlement_sources` (JSONB), `series.contract_url`, `series.additional_prohibitions` (JSONB)
@@ -332,7 +341,7 @@ Full SQL schema is in `/schema.sql`. ORM models live in `app/models/db.py`.
 - Workers log at `INFO` level for normal operation, `WARNING` for skipped items, `ERROR` for failures.
 - Workers must not crash the process on errors — wrap the body in `try/except Exception` and log.
 - Ingestion order matters: always sync `series → events → markets → outcomes` in sequence. Markets reference events; events reference series.
-- **Startup behavior**: DEV_MODE=True runs `run_kalshi_dev_sync()` on FastAPI startup before the WS connects. DEV_MODE=False (production) does NOT run any sync on startup — arq handles full sync on its 15min schedule. The WebSocket firehose starts as a background asyncio task in the web process in both modes.
+- **Startup behavior**: DEV_MODE=True runs `run_kalshi_dev_sync()` synchronously (fast, ~30s) before server starts. Polymarket dev sync runs as a background task (Gamma API is slow, ~10s/event) so the server starts immediately and Polymarket WS subscribes after sync completes. DEV_MODE=False (production) does NOT run any sync on startup — arq handles full sync on its 15min schedule. The Kalshi WS starts immediately; Polymarket WS starts after loading token IDs from DB.
 - **Write separation:** tick-level price data → Redis HSET (`ticker:{exchange}:{asset_id}`). Metadata → PostgreSQL. Live candles → Redis HSET (`candle:kalshi:{ticker}:{min_ts}`, 5-min TTL).
 - **Batch upserts via UNNEST**: ingest.py builds column arrays and uses `conn.execute(INSERT ... SELECT unnest($1::uuid[]), ...)` for bulk upserts in a single round-trip. Falls back to row-by-row on error to isolate bad rows.
 - **MVE filtering**: tickers starting with `KXMVE` are multivariate event (parlay/combo) markets — skipped at ingest to avoid DB bloat. Check `_is_mve(ticker)` in `ingest.py`.
@@ -476,7 +485,7 @@ DEV_MODE=false  # Set to true for local/free-tier development (restricts ingesti
 6. Background worker — injury detection running every 5 minutes
 7. OpenAI synthesis — plain English explanations generating
 8. Firebase notifications — push firing on real injury events
-9. Polymarket data ingestion — whale watching, sharp trader scoring
+9. ✅ Polymarket data ingestion — CLOB WS + Gamma API sync working; array taxonomy (categories/tags/series_ids) on events+series; PlatformTags table created
 10. Group betting social layer — simultaneous individual trade coordination
 11. Full API ready for iOS consumption
 

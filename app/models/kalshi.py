@@ -89,16 +89,16 @@ class KalshiSeries(BaseModel):
     @property
     def image_url(self) -> Optional[str]:
         """Extract image_url from product_metadata if present."""
-        if self.product_metadata and "image_url" in self.product_metadata:
-            return self.product_metadata["image_url"]
-        return None
+        metadata = self.product_metadata or {}
+        value = metadata.get("image_url")
+        return value if isinstance(value, str) else None
 
     @property
     def description(self) -> Optional[str]:
         """Extract description from product_metadata if present."""
-        if self.product_metadata and "description" in self.product_metadata:
-            return self.product_metadata["description"]
-        return None
+        metadata = self.product_metadata or {}
+        value = metadata.get("description")
+        return value if isinstance(value, str) else None
 
 
 class KalshiSeriesListResponse(BaseModel):

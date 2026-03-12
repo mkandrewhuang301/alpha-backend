@@ -12,6 +12,7 @@ import logging
 from kalshi_python_async import Configuration, KalshiClient
 from kalshi_python_async.api.market_api import MarketApi
 from kalshi_python_async.api.events_api import EventsApi
+from kalshi_python_async.api.search_api import SearchApi
 from kalshi_python_async.models import (
     GetSeriesResponse,
     GetEventsResponse,
@@ -19,10 +20,11 @@ from kalshi_python_async.models import (
     GetMarketsResponse,
     GetMarketResponse,
     GetEventMetadataResponse,
+    GetTagsForSeriesCategoriesResponse,
 )
 
 from app.core.config import KALSHI_API_KEY, KALSHI_PRIVATE_KEY, KALSHI_BASE_API_URL
-from app.models.kalshi import KalshiEventMetadata, KalshiSeriesListResponse
+from app.models.kalshi import KalshiEventMetadata, KalshiMarket, KalshiSeriesListResponse
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +50,9 @@ def _get_market_api() -> MarketApi:
 
 def _get_events_api() -> EventsApi:
     return EventsApi(_get_client())
+
+def _get_search_api() -> SearchApi:
+    return SearchApi(_get_client())
 
 # ---------------------------------------------------------------------------
 # Series
@@ -207,6 +212,56 @@ async def get_markets(
         raise
 
 
+async def get_markets_raw(
+    status: str | None = None,
+    series_ticker: str | None = None,
+    event_ticker: str | None = None,
+    limit: int | None = None,
+    cursor: str | None = None,
+    min_updated_ts: int | None = None,
+) -> tuple[list[KalshiMarket], str | None]:
+    """Fetch paginated markets using raw JSON, bypassing SDK model validation.
+
+    The SDK's Market model has required (non-Optional) price/volume fields
+    that the Kalshi API returns as null for closed/settled markets, causing
+    ValidationError. This function uses the same auth/transport but parses
+    with our own KalshiMarket model which has all Optional fields.
+
+    Returns (markets, next_cursor).
+    """
+    try:
+        market_api = _get_market_api()
+        _param = market_api._get_markets_serialize(
+            limit=limit,
+            cursor=cursor,
+            event_ticker=event_ticker,
+            series_ticker=series_ticker,
+            min_created_ts=None,
+            max_created_ts=None,
+            min_updated_ts=min_updated_ts,
+            max_close_ts=None,
+            min_close_ts=None,
+            min_settled_ts=None,
+            max_settled_ts=None,
+            status=status,
+            tickers=None,
+            mve_filter=None,
+            _request_auth=None,
+            _content_type=None,
+            _headers=None,
+            _host_index=0,
+        )
+        response_data = await market_api.api_client.call_api(*_param)
+        await response_data.read()
+        raw = json.loads(response_data.data)
+        markets = [KalshiMarket(**m) for m in (raw.get("markets") or [])]
+        next_cursor = raw.get("cursor")
+        return markets, next_cursor
+    except Exception as exc:
+        logger.error("[kalshi] Failed to fetch markets (raw): %s", exc)
+        raise
+
+
 async def get_market(ticker: str) -> GetMarketResponse:
     """Fetch a single market by ticker."""
     try:
@@ -272,3 +327,23 @@ async def batch_get_market_candlesticks(
     except Exception as exc:
         logger.error("[kalshi] Failed to batch fetch candlesticks for %s markets: %s", len(market_tickers), exc)
         raise
+
+
+# ---------------------------------------------------------------------------
+# Search / Taxonomy
+# ---------------------------------------------------------------------------
+
+async def get_tags_for_series_categories() -> dict[str, list[str]]:
+    """Fetch tags grouped by Kalshi series category from the SearchAPI.
+
+    Returns a dict mapping category name → list of tag label strings.
+    Used during ingest to populate PlatformTag rows with parent_id links.
+    Returns {} on error (non-blocking — taxonomy is supplementary).
+    """
+    try:
+        search_api = _get_search_api()
+        resp: GetTagsForSeriesCategoriesResponse = await search_api.get_tags_for_series_categories()
+        return resp.tags_by_categories or {}
+    except Exception as exc:
+        logger.warning("[kalshi] Failed to fetch tags for series categories: %s", exc)
+        return {}

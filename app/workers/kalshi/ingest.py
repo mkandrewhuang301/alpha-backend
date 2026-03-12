@@ -29,7 +29,13 @@ from app.services.kalshi import (
     get_event_metadata,
     get_events,
     get_markets,
+    get_markets_raw,
     get_series_list,
+    get_tags_for_series_categories,
+)
+from app.workers.taxonomy import (
+    upsert_platform_tag,
+    slugify,
 )
 
 logger = logging.getLogger(__name__)
@@ -112,14 +118,18 @@ async def sync_series() -> int:
             {"name": ss.name, "url": ss.url}
             for ss in (s.settlement_sources or [])
         ]
+        # categories: ARRAY(text) — list of category slugs
+        categories = [slugify(s.category)] if s.category else []
+        # tags: ARRAY(text) — list of tag slugs
+        tags = [slugify(t) if isinstance(t, str) else slugify(str(t)) for t in (s.tags or [])]
         rows.append((
             str(uuid.uuid4()),                         # id
             EXCHANGE,                                  # exchange
             s.ticker,                                  # ext_id
             s.title,                                   # title
             s.description,                             # description (from product_metadata)
-            _json.dumps([s.category] if s.category else []),  # category (JSONB list)
-            _json.dumps(s.tags or []),                  # tags (JSONB)
+            categories,                                # categories ARRAY(text)
+            tags,                                      # tags ARRAY(text)
             s.image_url,                               # image_url (from product_metadata)
             s.frequency,                               # frequency
             _json.dumps(settlement_sources),           # settlement_sources (JSONB)
@@ -145,17 +155,17 @@ async def sync_series() -> int:
             async with pool.acquire() as conn:
                 await conn.executemany(
                     """
-                    INSERT INTO series (id, exchange, ext_id, title, description, category, tags,
+                    INSERT INTO series (id, exchange, ext_id, title, description, categories, tags,
                                        image_url, frequency, settlement_sources, contract_url,
                                        additional_prohibitions, fee_type, fee_multiplier,
                                        volume_24h, total_volume, is_deleted, updated_at)
-                    VALUES ($1::uuid, $2, $3, $4, $5, $6::jsonb, $7::jsonb, $8, $9,
+                    VALUES ($1::uuid, $2, $3, $4, $5, $6::text[], $7::text[], $8, $9,
                             $10::jsonb, $11, $12::jsonb, $13, $14::numeric,
                             $15::numeric, $16::numeric, $17, $18)
                     ON CONFLICT ON CONSTRAINT uq_series_exchange_extid DO UPDATE SET
                         title = EXCLUDED.title,
                         description = EXCLUDED.description,
-                        category = EXCLUDED.category,
+                        categories = EXCLUDED.categories,
                         tags = EXCLUDED.tags,
                         image_url = EXCLUDED.image_url,
                         frequency = EXCLUDED.frequency,
@@ -176,6 +186,39 @@ async def sync_series() -> int:
             logger.error("[kalshi.ingest] Error in series batch upsert (batch %d-%d): %s", i, i + len(batch), exc, exc_info=True)
 
     logger.info("[kalshi.ingest] Series sync complete: %d processed", count)
+
+    # Upsert PlatformTags for each unique category encountered
+    seen_categories: set[str] = set()
+    for s in series_list:
+        if s.category and s.category not in seen_categories:
+            seen_categories.add(s.category)
+            await upsert_platform_tag(
+                pool, EXCHANGE, "category",
+                slug=slugify(s.category),
+                label=s.category,
+            )
+    logger.info(
+        "[kalshi.ingest] Upserted %d category platform_tags from series", len(seen_categories),
+    )
+
+    # Use SearchAPI to get all tags per category, upsert each tag with parent_id
+    # linking it to its parent category slug.
+    tags_by_category = await get_tags_for_series_categories()
+    tag_count = 0
+    for category_name, tag_labels in tags_by_category.items():
+        category_slug = slugify(category_name)
+        for tag_label in tag_labels:
+            if not tag_label:
+                continue
+            await upsert_platform_tag(
+                pool, EXCHANGE, "tag",
+                slug=slugify(tag_label),
+                label=tag_label,
+                parent_id=category_slug,
+            )
+            tag_count += 1
+    logger.info("[kalshi.ingest] Upserted %d tag platform_tags from SearchAPI", tag_count)
+
     return count
 
 
@@ -497,13 +540,21 @@ def _build_event_row(
     now: datetime,
     event_meta=None,
 ) -> tuple:
-    """Build a single event upsert row from a KalshiEvent."""
+    """Build a single event upsert row from a KalshiEvent.
+
+    Uses the new schema:
+      - series_ids: ARRAY(uuid) — single-element for Kalshi events
+      - categories: ARRAY(text) — slug strings cascaded from parent series
+      - tags: ARRAY(text) — empty for Kalshi (no structured tags in API)
+    """
     platform_metadata = {
         "strike_date": str(e.strike_date) if e.strike_date else None,
         "strike_period": e.strike_period,
         "collateral_return_type": e.collateral_return_type,
         "available_on_brokers": e.available_on_brokers,
         "product_metadata": e.product_metadata,
+        # Denormalized series ticker for API responses (avoid series join)
+        "series_ticker": e.series_ticker,
     }
 
     # Extract display metadata from event metadata response if available
@@ -525,90 +576,104 @@ def _build_event_row(
         competition = event_meta.competition
         competition_scope = event_meta.competition_scope
 
+    # series_ids: single-element UUID list for Kalshi (parent series)
+    series_ids = [series_id] if series_id else []
+
+    # categories: slug strings cascaded from the parent series category
+    categories = [slugify(e.category)] if e.category else []
+
+    # tags: Kalshi API doesn't return structured event-level tags
+    tags: list[str] = []
+
     return (
-        str(uuid.uuid4()),                         # 0: id
-        str(series_id) if series_id else None,     # 1: series_id
-        EXCHANGE,                                  # 2: exchange
-        e.event_ticker,                            # 3: ext_id
-        e.title,                                   # 4: title
-        e.sub_title,                               # 5: description
-        e.sub_title,                               # 6: sub_title
-        e.category,                                # 7: category
-        e.normalized_status,                       # 8: status
-        e.mutually_exclusive or False,             # 9: mutually_exclusive
-        e.close_time,                              # 10: close_time
-        e.expected_expiration_time,                # 11: expected_expiration_time
-        event_image_url,                           # 12: event_image_url
-        image_url,                                 # 13: image_url
-        featured_image_url,                        # 14: featured_image_url
-        settlement_sources_json,                   # 15: settlement_sources (JSONB)
-        competition,                               # 16: competition
-        competition_scope,                         # 17: competition_scope
-        0,                                         # 18: total_volume (aggregated later)
-        0,                                         # 19: open_interest (aggregated later)
-        _json.dumps(platform_metadata),            # 20: platform_metadata
-        False,                                     # 21: is_deleted
-        now,                                       # 22: updated_at
+        str(uuid.uuid4()),           # 0: id
+        series_ids,                  # 1: series_ids (list of uuid.UUID)
+        EXCHANGE,                    # 2: exchange
+        e.event_ticker,              # 3: ext_id
+        e.title,                     # 4: title
+        e.sub_title,                 # 5: description
+        e.sub_title,                 # 6: sub_title
+        categories,                  # 7: categories ARRAY(text)
+        tags,                        # 8: tags ARRAY(text)
+        e.normalized_status,         # 9: status
+        e.mutually_exclusive or False,  # 10: mutually_exclusive
+        e.close_time,                # 11: close_time
+        e.expected_expiration_time,  # 12: expected_expiration_time
+        event_image_url,             # 13: event_image_url
+        image_url,                   # 14: image_url
+        featured_image_url,          # 15: featured_image_url
+        settlement_sources_json,     # 16: settlement_sources (JSONB)
+        competition,                 # 17: competition
+        competition_scope,           # 18: competition_scope
+        0,                           # 19: total_volume (aggregated later)
+        0,                           # 20: open_interest (aggregated later)
+        _json.dumps(platform_metadata),  # 21: platform_metadata
+        False,                       # 22: is_deleted
+        now,                         # 23: updated_at
     )
 
 
 async def _upsert_events_returning(pool, rows: list[tuple]) -> dict[str, uuid.UUID]:
     """
-    Upsert event rows using UNNEST and return a {ext_id: id} mapping via RETURNING.
-    This lets us get event IDs immediately for nested market FK resolution.
+    Upsert event rows using row-by-row INSERT with RETURNING.
+
+    Returns a {ext_id: id} mapping for immediate market FK resolution.
+
+    Row tuple format (24 elements):
+      0: id (str UUID)
+      1: series_ids (list[uuid.UUID])
+      2: exchange (str)
+      3: ext_id (str)
+      4: title (str)
+      5: description (str)
+      6: sub_title (str)
+      7: categories (list[str])
+      8: tags (list[str])
+      9: status (str)
+      10: mutually_exclusive (bool)
+      11: close_time (datetime|None)
+      12: expected_expiration_time (datetime|None)
+      13: event_image_url (str|None)
+      14: image_url (str|None)
+      15: featured_image_url (str|None)
+      16: settlement_sources (str JSON)
+      17: competition (str|None)
+      18: competition_scope (str|None)
+      19: total_volume (number)
+      20: open_interest (number)
+      21: platform_metadata (str JSON)
+      22: is_deleted (bool)
+      23: updated_at (datetime)
     """
     if not rows:
         return {}
 
-    ids, series_ids, exchanges, ext_ids, titles, descriptions = [], [], [], [], [], []
-    sub_titles = []
-    categories, statuses, mutually_exclusives = [], [], []
-    close_times, expected_expiration_times = [], []
-    event_image_urls, image_urls, featured_image_urls, settlement_sources_list = [], [], [], []
-    competitions, competition_scopes = [], []
-    total_volumes, open_interests = [], []
-    platform_metas = []
-    is_deleteds, updated_ats = [], []
-
-    for r in rows:
-        ids.append(r[0]); series_ids.append(r[1]); exchanges.append(r[2])
-        ext_ids.append(r[3]); titles.append(r[4]); descriptions.append(r[5])
-        sub_titles.append(r[6])
-        categories.append(r[7]); statuses.append(r[8]); mutually_exclusives.append(r[9])
-        close_times.append(r[10]); expected_expiration_times.append(r[11])
-        event_image_urls.append(r[12]); image_urls.append(r[13])
-        featured_image_urls.append(r[14])
-        settlement_sources_list.append(r[15])
-        competitions.append(r[16]); competition_scopes.append(r[17])
-        total_volumes.append(r[18]); open_interests.append(r[19])
-        platform_metas.append(r[20]); is_deleteds.append(r[21]); updated_ats.append(r[22])
-
-    query = """
-        INSERT INTO events (id, series_id, exchange, ext_id, title, description,
-                           sub_title, category,
-                           status, mutually_exclusive, close_time, expected_expiration_time,
-                           event_image_url, image_url, featured_image_url, settlement_sources,
-                           competition, competition_scope,
-                           total_volume, open_interest,
-                           platform_metadata, is_deleted, updated_at)
-        SELECT
-            unnest($1::uuid[]), unnest($2::uuid[]), unnest($3::exchange_type[]), unnest($4::text[]),
-            unnest($5::text[]), unnest($6::text[]),
-            unnest($7::text[]), unnest($8::text[]),
-            unnest($9::market_status[]), unnest($10::boolean[]), unnest($11::timestamptz[]),
-            unnest($12::timestamptz[]),
-            unnest($13::text[]), unnest($14::text[]), unnest($15::text[]),
-            unnest($16::jsonb[]),
-            unnest($17::text[]), unnest($18::text[]),
-            unnest($19::numeric[]), unnest($20::numeric[]),
-            unnest($21::jsonb[]), unnest($22::boolean[]),
-            unnest($23::timestamptz[])
+    _INSERT_SQL = """
+        INSERT INTO events (
+            id, series_ids, exchange, ext_id, title, description,
+            sub_title, categories, tags,
+            status, mutually_exclusive, close_time, expected_expiration_time,
+            event_image_url, image_url, featured_image_url, settlement_sources,
+            competition, competition_scope,
+            total_volume, open_interest,
+            platform_metadata, is_deleted, updated_at
+        )
+        VALUES (
+            $1::uuid, $2::uuid[], $3::exchange_type, $4, $5, $6,
+            $7, $8::text[], $9::text[],
+            $10::market_status, $11, $12, $13,
+            $14, $15, $16, $17::jsonb,
+            $18, $19,
+            $20::numeric, $21::numeric,
+            $22::jsonb, $23, $24
+        )
         ON CONFLICT ON CONSTRAINT uq_events_exchange_extid DO UPDATE SET
-            series_id = EXCLUDED.series_id,
+            series_ids = EXCLUDED.series_ids,
             title = EXCLUDED.title,
             description = EXCLUDED.description,
             sub_title = EXCLUDED.sub_title,
-            category = EXCLUDED.category,
+            categories = EXCLUDED.categories,
+            tags = EXCLUDED.tags,
             status = EXCLUDED.status,
             mutually_exclusive = EXCLUDED.mutually_exclusive,
             close_time = EXCLUDED.close_time,
@@ -629,23 +694,49 @@ async def _upsert_events_returning(pool, rows: list[tuple]) -> dict[str, uuid.UU
         RETURNING ext_id, id
     """
 
+    result_map: dict[str, uuid.UUID] = {}
     try:
         async with pool.acquire() as conn:
-            result_rows = await conn.fetch(
-                query,
-                ids, series_ids, exchanges, ext_ids, titles, descriptions,
-                sub_titles, categories, statuses, mutually_exclusives,
-                close_times, expected_expiration_times,
-                event_image_urls, image_urls, featured_image_urls,
-                settlement_sources_list,
-                competitions, competition_scopes,
-                total_volumes, open_interests,
-                platform_metas, is_deleteds, updated_ats,
-            )
-        return {r["ext_id"]: r["id"] for r in result_rows}
+            for r in rows:
+                try:
+                    row = await conn.fetchrow(
+                        _INSERT_SQL,
+                        uuid.UUID(r[0]),  # id
+                        r[1],             # series_ids (list[uuid.UUID])
+                        r[2],             # exchange
+                        r[3],             # ext_id
+                        r[4],             # title
+                        r[5],             # description
+                        r[6],             # sub_title
+                        r[7],             # categories
+                        r[8],             # tags
+                        r[9],             # status
+                        r[10],            # mutually_exclusive
+                        r[11],            # close_time
+                        r[12],            # expected_expiration_time
+                        r[13],            # event_image_url
+                        r[14],            # image_url
+                        r[15],            # featured_image_url
+                        r[16],            # settlement_sources JSON string
+                        r[17],            # competition
+                        r[18],            # competition_scope
+                        r[19],            # total_volume
+                        r[20],            # open_interest
+                        r[21],            # platform_metadata JSON string
+                        r[22],            # is_deleted
+                        r[23],            # updated_at
+                    )
+                    if row:
+                        result_map[row["ext_id"]] = row["id"]
+                except Exception as row_exc:
+                    logger.error(
+                        "[kalshi.ingest] SKIPPED event ext_id=%s — upsert failed: %s",
+                        r[3], row_exc,
+                    )
     except Exception as exc:
-        logger.error("[kalshi.ingest] Batch event upsert failed (%d rows): %s", len(rows), exc, exc_info=True)
-        return {}
+        logger.error("[kalshi.ingest] Event upsert connection failed (%d rows): %s", len(rows), exc, exc_info=True)
+
+    return result_map
 
 
 async def sync_events_and_markets() -> tuple[int, int]:
@@ -831,23 +922,27 @@ async def _upsert_single_series(pool, s, now: datetime) -> None:
         {"name": ss.name, "url": ss.url}
         for ss in (s.settlement_sources or [])
     ]
+    raw_category = getattr(s, "category", None)
+    categories = [slugify(raw_category)] if raw_category else []
+    raw_tags = getattr(s, "tags", None) or []
+    tags = [slugify(t) if isinstance(t, str) else slugify(str(t)) for t in raw_tags]
 
     async with pool.acquire() as conn:
         await conn.execute(
             """
-            INSERT INTO series (id, exchange, ext_id, title, description, category,
+            INSERT INTO series (id, exchange, ext_id, title, description, categories,
                                tags, image_url, frequency, settlement_sources,
                                contract_url, additional_prohibitions,
                                fee_type, fee_multiplier, volume_24h, total_volume,
                                is_deleted, updated_at)
-            VALUES ($1::uuid, $2, $3, $4, $5, $6, $7::jsonb, $8, $9,
+            VALUES ($1::uuid, $2, $3, $4, $5, $6::text[], $7::text[], $8, $9,
                     $10::jsonb, $11, $12::jsonb,
                     $13, $14::numeric, $15::numeric, $16::numeric,
                     $17, $18)
             ON CONFLICT ON CONSTRAINT uq_series_exchange_extid DO UPDATE SET
                 title = EXCLUDED.title,
                 description = EXCLUDED.description,
-                category = EXCLUDED.category,
+                categories = EXCLUDED.categories,
                 tags = EXCLUDED.tags,
                 image_url = EXCLUDED.image_url,
                 frequency = EXCLUDED.frequency,
@@ -865,8 +960,8 @@ async def _upsert_single_series(pool, s, now: datetime) -> None:
             s.ticker,
             s.title,
             getattr(s, "description", None),
-            getattr(s, "category", None),
-            _json.dumps(getattr(s, "tags", None) or []),
+            categories,
+            tags,
             getattr(s, "image_url", None),
             getattr(s, "frequency", None),
             _json.dumps(settlement_sources),
@@ -935,7 +1030,7 @@ async def run_kalshi_dev_sync() -> None:
             cat, len(found_in_cat), len(tickers), found_in_cat,
         )
 
-    # ---- Step 2: Upsert selected series ----
+    # ---- Step 2: Upsert selected series + platform tags ----
     for s in selected_series:
         try:
             await _upsert_single_series(pool, s, now)
@@ -945,6 +1040,32 @@ async def run_kalshi_dev_sync() -> None:
 
     # Pre-load series map for FK resolution
     series_map = await _load_ext_id_map(pool, "series")
+
+    # Upsert PlatformTags for each unique category encountered in selected series
+    seen_categories: set[str] = set()
+    for s in selected_series:
+        if s.category and s.category not in seen_categories:
+            seen_categories.add(s.category)
+            await upsert_platform_tag(
+                pool, EXCHANGE, "category",
+                slug=slugify(s.category),
+                label=s.category,
+            )
+
+    # Use SearchAPI to get all tags per category, upsert each with parent_id link
+    tags_by_category = await get_tags_for_series_categories()
+    for category_name, tag_labels in tags_by_category.items():
+        category_slug = slugify(category_name)
+        for tag_label in tag_labels:
+            if not tag_label:
+                continue
+            await upsert_platform_tag(
+                pool, EXCHANGE, "tag",
+                slug=slugify(tag_label),
+                label=tag_label,
+                parent_id=category_slug,
+            )
+
     target_series_tickers = [s.ticker for s in selected_series]
 
     # ---- Step 3: Sync events + markets per series ----
@@ -961,9 +1082,11 @@ async def run_kalshi_dev_sync() -> None:
         while True:
             page += 1
             try:
+                # Fetch events WITHOUT nested markets to avoid SDK validation
+                # errors on closed/settled markets with null price fields.
                 resp = await get_events(
                     series_ticker=series_ticker,
-                    with_nested_markets=True,
+                    with_nested_markets=False,
                     limit=200,
                     cursor=cursor,
                     status="open",
@@ -1014,20 +1137,25 @@ async def run_kalshi_dev_sync() -> None:
                 page_event_map.update(batch_map)
             total_events += len(page_event_map)
 
-            # Build market rows
+            # Fetch markets separately per event using raw bypass to avoid SDK
+            # validation errors when closed/settled markets have null price fields.
             market_rows = []
             valid_markets: list[KalshiMarket] = []
             for e in non_mve_events:
                 event_id = page_event_map.get(e.event_ticker)
                 if event_id is None:
                     continue
-                for m in (e.markets or []):
-                    market_rows.append(
-                        _build_market_row(m, event_id, now, market_metadata_cache)
-                    )
-                    valid_markets.append(m)
-                    if m.normalized_status == "active":
-                        new_target_markets.append(m.ticker)
+                try:
+                    raw_markets, _ = await get_markets_raw(event_ticker=e.event_ticker, limit=200)
+                    for m in raw_markets:
+                        if _is_mve(m.ticker):
+                            continue
+                        market_rows.append(_build_market_row(m, event_id, now, market_metadata_cache))
+                        valid_markets.append(m)
+                        if m.normalized_status == "active":
+                            new_target_markets.append(m.ticker)
+                except Exception as mkt_exc:
+                    logger.warning("[kalshi.ingest] DEV: Could not fetch markets for %s: %s", e.event_ticker, mkt_exc)
 
             # Upsert markets
             for i in range(0, len(market_rows), BATCH_SIZE):

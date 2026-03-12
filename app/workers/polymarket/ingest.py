@@ -38,6 +38,10 @@ import httpx
 
 from app.core.database import get_asyncpg_pool
 from app.models.polymarket import map_polymarket_status
+from app.workers.taxonomy import (
+    upsert_platform_tag,
+    slugify,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -195,12 +199,20 @@ async def _upsert_series(pool, series_dict: dict) -> Optional[uuid.UUID]:
     image_url = series_dict.get("image") or series_dict.get("icon")
     frequency = series_dict.get("recurrence")
 
-    # Categories as JSONB list
+    # categories: ARRAY(text) — slug strings from API category labels
     category_labels = _extract_category_labels(series_dict)
+    categories = [slugify(label) for label in category_labels if label]
 
-    # Tags (array of strings from API)
+    # tags: ARRAY(text) — slug strings from API tag list
     tags_raw = series_dict.get("tags") or []
-    tags = [str(t) for t in tags_raw if t]
+    tags = []
+    for t in tags_raw:
+        if isinstance(t, dict):
+            tag_slug = t.get("slug") or slugify(t.get("label") or str(t.get("id", "")))
+        else:
+            tag_slug = slugify(str(t)) if t else ""
+        if tag_slug:
+            tags.append(tag_slug)
 
     # Volume metrics
     volume_24h = Decimal(str(series_dict.get("volume24hr") or 0))
@@ -221,20 +233,20 @@ async def _upsert_series(pool, series_dict: dict) -> Optional[uuid.UUID]:
                 """
                 INSERT INTO series (
                     id, exchange, ext_id, title, description,
-                    category, tags, image_url, frequency,
+                    categories, tags, image_url, frequency,
                     volume_24h, total_volume,
                     platform_metadata, is_deleted, updated_at
                 )
                 VALUES (
                     $1::uuid, $2::exchange_type, $3, $4, $5,
-                    $6::jsonb, $7::jsonb, $8, $9,
+                    $6::text[], $7::text[], $8, $9,
                     $10::numeric, $11::numeric,
                     $12::jsonb, FALSE, $13
                 )
                 ON CONFLICT ON CONSTRAINT uq_series_exchange_extid DO UPDATE SET
                     title = EXCLUDED.title,
                     description = EXCLUDED.description,
-                    category = EXCLUDED.category,
+                    categories = EXCLUDED.categories,
                     tags = EXCLUDED.tags,
                     image_url = COALESCE(EXCLUDED.image_url, series.image_url),
                     frequency = EXCLUDED.frequency,
@@ -249,8 +261,8 @@ async def _upsert_series(pool, series_dict: dict) -> Optional[uuid.UUID]:
                 series_id_str,          # ext_id = stable Polymarket series id
                 title,
                 description,
-                _json.dumps(category_labels),   # category = JSONB list
-                _json.dumps(tags),              # tags = JSONB list
+                categories,             # categories ARRAY(text)
+                tags,                   # tags ARRAY(text)
                 image_url,
                 frequency,
                 volume_24h,
@@ -258,10 +270,21 @@ async def _upsert_series(pool, series_dict: dict) -> Optional[uuid.UUID]:
                 platform_metadata,
                 now,
             )
-        return uuid.UUID(str(row["id"]))
+        db_series_id = uuid.UUID(str(row["id"]))
     except Exception as exc:
         logger.error("[polymarket.ingest] Failed to upsert series id=%s: %s", series_id_str, exc)
         return None
+
+    # Upsert PlatformTags for each category
+    for label in category_labels:
+        if label:
+            await upsert_platform_tag(
+                pool, EXCHANGE, "category",
+                slug=slugify(label),
+                label=label,
+            )
+
+    return db_series_id
 
 
 # ---------------------------------------------------------------------------
@@ -288,7 +311,6 @@ async def _upsert_event(
     slug = event_dict.get("slug") or ""
     title = event_dict.get("title") or event_dict.get("question") or ext_id
     description = event_dict.get("description")
-    category = event_dict.get("category")
     image_url = event_dict.get("image") or event_dict.get("featuredImage")
 
     active = event_dict.get("active", True)
@@ -325,6 +347,39 @@ async def _upsert_event(
         "neg_risk": neg_risk,
     })
 
+    # series_ids: ARRAY(uuid) — include the parent series if provided
+    series_ids: list[uuid.UUID] = [series_id] if series_id else []
+
+    # categories: ARRAY(text) — combine event category + subcategory as slugs.
+    # Polymarket's category/subcategory fields are often null; fall back to using
+    # the first tag slug as the category so events remain filterable.
+    raw_category = event_dict.get("category")
+    raw_subcategory = event_dict.get("subcategory") or event_dict.get("subCategory")
+    categories: list[str] = []
+    if raw_category:
+        categories.append(slugify(raw_category))
+    if raw_subcategory and slugify(raw_subcategory) not in categories:
+        categories.append(slugify(raw_subcategory))
+
+    # tags: ARRAY(text) — extract slug strings from tag objects
+    tags_raw = event_dict.get("tags") or []
+    tags: list[str] = []
+    for tag_dict in tags_raw:
+        if isinstance(tag_dict, dict):
+            tag_slug = tag_dict.get("slug") or ""
+            if not tag_slug:
+                tag_label = tag_dict.get("label") or ""
+                tag_slug = slugify(tag_label) if tag_label else ""
+            if tag_slug:
+                tags.append(tag_slug)
+        elif isinstance(tag_dict, str) and tag_dict:
+            tags.append(slugify(tag_dict))
+
+    # If category/subcategory both null (common on Polymarket), derive categories
+    # from tags so events are still categorizable. Use first tag as primary category.
+    if not categories and tags:
+        categories = tags[:1]
+
     internal_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc)
 
@@ -333,19 +388,21 @@ async def _upsert_event(
             row = await conn.fetchrow(
                 """
                 INSERT INTO events (
-                    id, series_id, exchange, ext_id, title, description,
-                    category, status, close_time, volume_24h, image_url,
+                    id, series_ids, exchange, ext_id, title, description,
+                    categories, tags, status, close_time, volume_24h, image_url,
                     platform_metadata, is_deleted, updated_at
                 )
                 VALUES (
-                    $1::uuid, $2::uuid, $3::exchange_type, $4, $5, $6,
-                    $7, $8::market_status, $9, $10::numeric, $11,
-                    $12::jsonb, FALSE, $13
+                    $1::uuid, $2::uuid[], $3::exchange_type, $4, $5, $6,
+                    $7::text[], $8::text[], $9::market_status, $10, $11::numeric, $12,
+                    $13::jsonb, FALSE, $14
                 )
                 ON CONFLICT ON CONSTRAINT uq_events_exchange_extid DO UPDATE SET
+                    series_ids = EXCLUDED.series_ids,
                     title = EXCLUDED.title,
                     description = EXCLUDED.description,
-                    category = EXCLUDED.category,
+                    categories = EXCLUDED.categories,
+                    tags = EXCLUDED.tags,
                     status = EXCLUDED.status,
                     close_time = EXCLUDED.close_time,
                     volume_24h = EXCLUDED.volume_24h,
@@ -355,12 +412,13 @@ async def _upsert_event(
                 RETURNING id
                 """,
                 internal_id,
-                str(series_id) if series_id else None,
+                series_ids,             # series_ids ARRAY(uuid)
                 EXCHANGE,
-                ext_id,             # ext_id = stable Polymarket event id
+                ext_id,                 # ext_id = stable Polymarket event id
                 title,
                 description,
-                category,
+                categories,             # categories ARRAY(text)
+                tags,                   # tags ARRAY(text)
                 status,
                 close_time,
                 volume_24h,
@@ -368,10 +426,42 @@ async def _upsert_event(
                 platform_metadata,
                 now,
             )
-        return uuid.UUID(str(row["id"]))
+        db_event_id = uuid.UUID(str(row["id"]))
     except Exception as exc:
         logger.error("[polymarket.ingest] Failed to upsert event id=%s: %s", ext_id, exc)
         return None
+
+    # Upsert PlatformTags for categories.
+    # Top-level category has no parent; subcategory links to parent via parent_id.
+    if raw_category:
+        await upsert_platform_tag(
+            pool, EXCHANGE, "category",
+            slug=slugify(raw_category),
+            label=raw_category,
+        )
+    if raw_subcategory:
+        await upsert_platform_tag(
+            pool, EXCHANGE, "category",
+            slug=slugify(raw_subcategory),
+            label=raw_subcategory,
+            parent_id=slugify(raw_category) if raw_category else None,
+        )
+
+    # Upsert PlatformTags for tags
+    for tag_dict in tags_raw:
+        if isinstance(tag_dict, dict):
+            tag_slug = tag_dict.get("slug") or ""
+            tag_label = tag_dict.get("label") or ""
+            tag_ext_id = str(tag_dict.get("id", "")) if tag_dict.get("id") else tag_slug
+            if tag_slug and tag_label:
+                await upsert_platform_tag(
+                    pool, EXCHANGE, "tag",
+                    slug=tag_slug,
+                    label=tag_label,
+                    ext_id=tag_ext_id,
+                )
+
+    return db_event_id
 
 
 # ---------------------------------------------------------------------------
@@ -568,6 +658,7 @@ async def _process_series(pool, series_dict: dict) -> list[str]:
         return []
 
     all_token_ids: list[str] = []
+    event_categories_seen: set[str] = set()
 
     # 2. Get events — prefer nested array, fall back to separate API call
     events = series_dict.get("events") or []
@@ -589,10 +680,42 @@ async def _process_series(pool, series_dict: dict) -> list[str]:
         if db_event_id is None:
             continue
 
+        # Collect categories from events to back-fill series categories
+        raw_cat = event_dict.get("category")
+        raw_subcat = event_dict.get("subcategory") or event_dict.get("subCategory")
+        event_tags = [
+            (t.get("slug") or slugify(t.get("label") or ""))
+            for t in (event_dict.get("tags") or [])
+            if isinstance(t, dict) and (t.get("slug") or t.get("label"))
+        ]
+        if raw_cat:
+            event_categories_seen.add(slugify(raw_cat))
+        elif raw_subcat:
+            event_categories_seen.add(slugify(raw_subcat))
+        elif event_tags:
+            event_categories_seen.add(event_tags[0])
+
         markets = event_dict.get("markets") or []
         for market_dict in markets:
             token_ids = await _upsert_market_with_outcomes(pool, market_dict, db_event_id)
             all_token_ids.extend(token_ids)
+
+    # Back-fill series categories from event categories if series has none
+    if event_categories_seen:
+        derived_categories = sorted(event_categories_seen)
+        try:
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    """
+                    UPDATE series
+                    SET categories = $1::text[], updated_at = NOW()
+                    WHERE id = $2::uuid
+                      AND (categories IS NULL OR array_length(categories, 1) IS NULL)
+                    """,
+                    derived_categories, str(db_series_id),
+                )
+        except Exception as exc:
+            logger.warning("[polymarket.ingest] Could not back-fill series categories: %s", exc)
 
     logger.info(
         "[polymarket.ingest] Processed series id=%s slug=%s events=%d tokens=%d",
