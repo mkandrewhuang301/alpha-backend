@@ -84,7 +84,8 @@ class User(Base):
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     email = Column(String(255), unique=True, nullable=False)
-    password_hash = Column(Text, nullable=False)
+    magic_did = Column(Text, unique=True, nullable=False)
+    eoa_address = Column(Text, unique=True, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=text("NOW()"))
     updated_at = Column(DateTime(timezone=True), server_default=text("NOW()"), onupdate=lambda: datetime.now(timezone.utc))
 
@@ -99,6 +100,7 @@ class Account(Base):
     user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="RESTRICT"), nullable=False)
     exchange = Column(exchange_enum, nullable=False)
     ext_account_id = Column(Text, nullable=False)
+    safe_address = Column(Text, unique=True, nullable=True)  # Polymarket only — Gnosis Safe address on Polygon
     encrypted_api_key = Column(Text)
     encrypted_api_secret = Column(Text)
     encrypted_passphrase = Column(Text)
