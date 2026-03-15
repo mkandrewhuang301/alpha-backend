@@ -137,20 +137,33 @@ PostgreSQL + Redis ──► FastAPI routes ──► iOS app
 **Polymarket WebSocket strategy (`workers/polymarket/stream.py`):**
 ```
 Both DEV_MODE and production use the same micro-batching flusher:
-  WS receive loop → _enqueue_ticker(msg) → asyncio.Queue(maxsize=100_000) (non-blocking, drops if full)
+  WS receive loop → _parse_and_enqueue(msg) → asyncio.Queue(maxsize=100_000) (non-blocking, drops if full)
   _redis_flusher() → drain in 100ms/500-item batches → pipeline HSET ticker:polymarket:{token_id}
                    → Phase 2: ZADD events_trending_24h_polymarket (volume from tick data)
-                   → Phase 3: drain _resolution_candidates → asyncio.create_task(_check_and_update_market_resolution())
+                   → Phase 3: drain _ws_resolutions dict → asyncio.create_task(_apply_ws_resolution())
+                   → Phase 4: drain _resolution_candidates → asyncio.create_task(_check_and_update_market_resolution())
 
-Resolution candidate detection:
-  last_trade_price >= 0.99 or <= 0.01 → add token_id to _resolution_candidates set
-  _check_and_update_market_resolution(token_id):
-    → Semaphore(3) — caps concurrent Supabase connections
-    → GET Gamma API /markets?conditionId={id}
-    → if tokens[].winner == true → UPDATE markets SET status='resolved', result={outcome}
+Subscribe message (custom_feature_enabled=true required for market_resolved/new_market/best_bid_ask):
+  {"type": "market", "assets_ids": [token_id, ...], "custom_feature_enabled": true}
 
-Subscribe message:
-  {"type": "market", "assets_ids": [token_id, ...]}  (all synced token IDs)
+Message types handled:
+  book            → _handle_book_message() — bids/asks are {"price": "0.48", "size": "30"} dicts (not tuples)
+  price_change    → _handle_price_change_message() — top-level price_changes array (multi-asset per msg)
+                    each entry has asset_id, best_bid, best_ask directly from exchange
+  best_bid_ask    → _handle_best_bid_ask_message() — authoritative best bid/ask (custom_feature_enabled)
+  last_trade_price → _handle_last_trade_price_message() — last traded price, resolution detection
+  tick_size_change → _handle_tick_size_change_message() — new_tick_size field (not tick_size)
+  market_resolved  → _handle_market_resolved_message() — direct resolution (Path A, no Gamma roundtrip)
+  new_market       → _handle_new_market_message() — logged, picked up by reconciliation cron
+
+Resolution paths (two-tier):
+  Path A (WS market_resolved event — preferred, no Gamma API):
+    winning_asset_id + winning_outcome from WS → _ws_resolutions dict
+    → _apply_ws_resolution(token_id, outcome) → DB lookup → Postgres UPDATE
+  Path B (last_trade_price fallback — Gamma API confirm):
+    last_trade_price >= 0.99 or <= 0.01 → _resolution_candidates set
+    → _check_and_update_market_resolution(token_id) → Gamma API → Postgres UPDATE
+  Both paths: Semaphore(3) — caps concurrent Supabase connections
 ```
 
 **Kalshi WebSocket strategy (`workers/kalshi/stream.py`) — for when it's re-enabled:**

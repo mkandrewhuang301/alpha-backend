@@ -6,26 +6,33 @@ AND market lifecycle events for the ERC-1155 token IDs collected by the ingestio
 
 WebSocket endpoint: wss://ws-subscriptions-clob.polymarket.com/ws/market
 Auth: None — public read-only feed
-Subscribe: {"type": "market", "assets_ids": ["0x...", ...]}
+Subscribe: {"type": "market", "assets_ids": [...], "custom_feature_enabled": true}
 
 Message types handled:
-    book            — full orderbook snapshot (bids/asks arrays) → Redis HSET
-    price_change    — incremental orderbook update → Redis HSET
-    last_trade_price — last traded price (settlement signal) → Redis HSET + resolution check
-    tick_size_change — tick size update → Redis HSET
+    book              — full orderbook snapshot (bids/asks arrays) → Redis HSET
+    price_change      — incremental orderbook update (price_changes array) → Redis HSET
+    best_bid_ask      — best bid/ask update (custom_feature_enabled) → Redis HSET
+    last_trade_price  — last traded price (settlement signal) → Redis HSET + resolution check
+    tick_size_change  — tick size update → Redis HSET
+    market_resolved   — market resolved event (custom_feature_enabled) → direct Postgres UPDATE
+    new_market        — new market created (custom_feature_enabled) → logged, picked up by reconciliation
 
-Lifecycle / resolution:
-    When last_trade_price hits 0.99+ or 0.01-, it signals a market near resolution.
-    The flusher fires a background _check_and_update_market_resolution task that:
-        1. Queries the Gamma API for the market's current status
-        2. If resolved/closed, updates markets.status + markets.result in Postgres
-    This mirrors Kalshi's market_lifecycle_v2 handler pattern.
+Lifecycle / resolution (two paths):
+    Path A — WS market_resolved event (preferred, zero Gamma API calls):
+        market_resolved msg → _ws_resolutions dict → flusher fires _apply_ws_resolution task
+        → Postgres UPDATE (status=resolved, result=winning_outcome)
+
+    Path B — last_trade_price settlement signal (fallback, uses Gamma API):
+        last_trade_price >= 0.99 or <= 0.01 → _resolution_candidates set
+        → flusher fires _check_and_update_market_resolution task
+        → Gamma API confirm → Postgres UPDATE
 
 Architecture:
     1. WS receive loop: parse JSON, put into asyncio.Queue (non-blocking)
     2. _redis_flusher: drains queue in 100ms/500-item batches → Redis HSET pipeline
     3. ZADD events_trending_24h_polymarket per flush cycle (volume rollup)
     4. Resolution candidates → asyncio.create_task(_check_and_update_market_resolution)
+    5. WS resolutions → asyncio.create_task(_apply_ws_resolution)
 
 Redis key schema:
     ticker:polymarket:{token_id}
@@ -74,9 +81,13 @@ _lifecycle_semaphore = asyncio.Semaphore(3)
 # Token-ID → event ext_id mapping for ZSET trending aggregation.
 _token_to_event: dict[str, str] = {}
 
-# Resolution candidates detected by the receive loop.
+# Resolution candidates detected by the receive loop (Path B — Gamma API confirm).
 # The flusher drains this set and fires asyncio tasks.
 _resolution_candidates: set[str] = set()
+
+# WS-driven resolutions (Path A — direct, no Gamma API roundtrip).
+# token_id → winning_outcome string.
+_ws_resolutions: dict[str, str] = {}
 
 
 def set_token_event_map(mapping: dict[str, str]) -> None:
@@ -146,7 +157,12 @@ def _get_mid_price(bid: Optional[str], ask: Optional[str]) -> str:
 # ---------------------------------------------------------------------------
 
 def _handle_book_message(msg: dict) -> Optional[PolymarketTickerUpdate]:
-    """Parse a 'book' orderbook snapshot message."""
+    """
+    Parse a 'book' orderbook snapshot message.
+
+    bids/asks are arrays of {"price": "0.48", "size": "30"} dicts,
+    ordered best-first by the CLOB API.
+    """
     asset_id = msg.get("asset_id") or msg.get("assetId", "")
     if not asset_id:
         return None
@@ -154,10 +170,11 @@ def _handle_book_message(msg: dict) -> Optional[PolymarketTickerUpdate]:
     bids = msg.get("bids") or []
     asks = msg.get("asks") or []
 
-    best_bid = bids[0][0] if bids else "0"
-    best_bid_size = bids[0][1] if bids else "0"
-    best_ask = asks[0][0] if asks else "0"
-    best_ask_size = asks[0][1] if asks else "0"
+    # Each entry is a dict: {"price": "0.48", "size": "30"}
+    best_bid = str(bids[0].get("price", "0")) if bids else "0"
+    best_bid_size = str(bids[0].get("size", "0")) if bids else "0"
+    best_ask = str(asks[0].get("price", "0")) if asks else "0"
+    best_ask_size = str(asks[0].get("size", "0")) if asks else "0"
 
     _orderbook_state[asset_id] = {
         "bid": best_bid,
@@ -180,31 +197,82 @@ def _handle_book_message(msg: dict) -> Optional[PolymarketTickerUpdate]:
     )
 
 
-def _handle_price_change_message(msg: dict) -> Optional[PolymarketTickerUpdate]:
-    """Parse a 'price_change' incremental update message."""
+def _handle_price_change_message(msg: dict) -> list[PolymarketTickerUpdate]:
+    """
+    Parse a 'price_change' incremental update message.
+
+    A single price_change message carries a top-level `price_changes` array
+    that may contain updates for multiple asset IDs simultaneously. Each entry
+    includes `best_bid` and `best_ask` from the exchange — use these directly
+    rather than recomputing from accumulated book state.
+
+    Returns a list (may be empty) of PolymarketTickerUpdate.
+    """
+    price_changes = msg.get("price_changes") or []
+    ts = str(int(time.time()))
+    updates: list[PolymarketTickerUpdate] = []
+
+    for change in price_changes:
+        asset_id = str(change.get("asset_id") or "")
+        if not asset_id:
+            continue
+
+        best_bid = str(change.get("best_bid") or "0")
+        best_ask = str(change.get("best_ask") or "0")
+        price = str(change.get("price") or "0")
+        size = str(change.get("size") or "0")
+        side = str(change.get("side") or "").upper()
+
+        # Update in-memory state with exchange-reported best bid/ask
+        state = _orderbook_state.get(asset_id, {})
+        if side == "BUY":
+            state["bid"] = best_bid
+            state["bid_size"] = size
+        elif side == "SELL":
+            state["ask"] = best_ask
+            state["ask_size"] = size
+        # Always persist best bid/ask regardless of side (exchange provides them)
+        if best_bid and best_bid != "0":
+            state["bid"] = best_bid
+        if best_ask and best_ask != "0":
+            state["ask"] = best_ask
+        _orderbook_state[asset_id] = state
+
+        updates.append(PolymarketTickerUpdate(
+            token_id=asset_id,
+            event_ext_id=_token_to_event.get(asset_id, ""),
+            redis_key=_make_key(EXCHANGE, asset_id),
+            price=_get_mid_price(best_bid or None, best_ask or None),
+            bid=state.get("bid", "0"),
+            bid_size=state.get("bid_size", "0"),
+            ask=state.get("ask", "0"),
+            ask_size=state.get("ask_size", "0"),
+            volume_24h="0",
+            ts=ts,
+        ))
+
+    return updates
+
+
+def _handle_best_bid_ask_message(msg: dict) -> Optional[PolymarketTickerUpdate]:
+    """
+    Parse a 'best_bid_ask' event (requires custom_feature_enabled: true).
+
+    Provides authoritative best bid/ask directly from the exchange — more
+    reliable than computing from incremental price_change events.
+    """
     asset_id = msg.get("asset_id") or msg.get("assetId", "")
     if not asset_id:
         return None
 
-    changes = msg.get("changes") or []
+    best_bid = str(msg.get("best_bid") or "0")
+    best_ask = str(msg.get("best_ask") or "0")
+
+    # Update in-memory state — authoritative source
     state = _orderbook_state.get(asset_id, {})
-
-    for change in changes:
-        price_val = str(change.get("price", "0"))
-        size_val = str(change.get("size", "0"))
-        side = str(change.get("side", "")).upper()
-
-        if side == "BUY":
-            state["bid"] = price_val
-            state["bid_size"] = size_val
-        elif side == "SELL":
-            state["ask"] = price_val
-            state["ask_size"] = size_val
-
+    state["bid"] = best_bid
+    state["ask"] = best_ask
     _orderbook_state[asset_id] = state
-
-    best_bid = state.get("bid", "0")
-    best_ask = state.get("ask", "0")
 
     return PolymarketTickerUpdate(
         token_id=asset_id,
@@ -226,7 +294,8 @@ def _handle_last_trade_price_message(msg: dict) -> Optional[PolymarketTickerUpda
 
     Caches last trade price/side in Redis. If the price indicates settlement
     (>= 0.99 or <= 0.01), marks the token as a resolution candidate so the
-    flusher can fire a Gamma API + DB update.
+    flusher can fire a Gamma API + DB update (Path B fallback — Path A via
+    market_resolved WS event is preferred).
     """
     asset_id = msg.get("asset_id") or msg.get("assetId", "")
     if not asset_id:
@@ -264,12 +333,14 @@ def _handle_tick_size_change_message(msg: dict) -> Optional[PolymarketTickerUpda
     Parse a 'tick_size_change' message.
 
     Stores the new tick size as a Redis HSET field on the token key.
+    The API sends `new_tick_size` (not `tick_size`) in the message body.
     """
     asset_id = msg.get("asset_id") or msg.get("assetId", "")
     if not asset_id:
         return None
 
-    tick_size = str(msg.get("tick_size") or msg.get("tickSize") or "")
+    # API field is new_tick_size
+    tick_size = str(msg.get("new_tick_size") or msg.get("tick_size") or "")
     if not tick_size:
         return None
 
@@ -290,40 +361,165 @@ def _handle_tick_size_change_message(msg: dict) -> Optional[PolymarketTickerUpda
     )
 
 
-def _parse_and_enqueue(msg: dict) -> None:
-    """Parse a WS message and enqueue the TickerUpdate (non-blocking)."""
-    event_type = msg.get("event_type", "")
-    update: Optional[PolymarketTickerUpdate] = None
+def _handle_market_resolved_message(msg: dict) -> None:
+    """
+    Handle a 'market_resolved' WS event (requires custom_feature_enabled: true).
 
-    if event_type == "book":
-        update = _handle_book_message(msg)
-    elif event_type == "price_change":
-        update = _handle_price_change_message(msg)
-    elif event_type == "last_trade_price":
-        update = _handle_last_trade_price_message(msg)
-    elif event_type == "tick_size_change":
-        update = _handle_tick_size_change_message(msg)
-    # Unknown types silently ignored
+    The WS event provides the winning_asset_id and winning_outcome directly —
+    no Gamma API roundtrip needed. Queue for direct Postgres UPDATE in flusher
+    Phase 3 (Path A resolution, faster than the last_trade_price → Gamma path).
+    """
+    winning_asset_id = str(msg.get("winning_asset_id") or "")
+    winning_outcome = str(msg.get("winning_outcome") or "")
 
-    if update is None:
-        return
-
-    try:
-        _get_ticker_queue().put_nowait(update)
-    except asyncio.QueueFull:
-        logger.warning(
-            "[polymarket.stream] Ticker queue full, dropping update for token %s",
-            update.token_id,
+    if winning_asset_id and winning_outcome:
+        _ws_resolutions[winning_asset_id] = winning_outcome
+        logger.info(
+            "[polymarket.stream] WS market_resolved: token=%s...  outcome=%s",
+            winning_asset_id[:20], winning_outcome,
+        )
+    else:
+        # Fallback: add all asset IDs to the Gamma-confirm path
+        for aid in (msg.get("assets_ids") or []):
+            _resolution_candidates.add(str(aid))
+        logger.info(
+            "[polymarket.stream] WS market_resolved (no winner info): "
+            "%d assets queued for Gamma confirm",
+            len(msg.get("assets_ids") or []),
         )
 
 
+def _handle_new_market_message(msg: dict) -> None:
+    """
+    Handle a 'new_market' WS event (requires custom_feature_enabled: true).
+
+    We can't subscribe to the new tokens without reconnecting, so we log
+    the event. The Polymarket state reconciliation cron (every 2min in DEV,
+    every 2min in prod) will pick up new markets on its next run.
+    """
+    question = str(msg.get("question") or "unknown")
+    slug = str(msg.get("slug") or "")
+    assets_ids = msg.get("assets_ids") or []
+    logger.info(
+        "[polymarket.stream] new_market detected: '%s' (slug=%s, %d assets) — "
+        "will be ingested on next reconciliation run",
+        question[:80], slug, len(assets_ids),
+    )
+
+
+def _parse_and_enqueue(msg: dict) -> None:
+    """Parse a WS message and enqueue resulting TickerUpdate(s) (non-blocking)."""
+    event_type = msg.get("event_type", "")
+    updates: list[PolymarketTickerUpdate] = []
+
+    if event_type == "book":
+        u = _handle_book_message(msg)
+        if u:
+            updates.append(u)
+    elif event_type == "price_change":
+        # Returns a list — may contain multiple assets
+        updates.extend(_handle_price_change_message(msg))
+    elif event_type == "best_bid_ask":
+        u = _handle_best_bid_ask_message(msg)
+        if u:
+            updates.append(u)
+    elif event_type == "last_trade_price":
+        u = _handle_last_trade_price_message(msg)
+        if u:
+            updates.append(u)
+    elif event_type == "tick_size_change":
+        u = _handle_tick_size_change_message(msg)
+        if u:
+            updates.append(u)
+    elif event_type == "market_resolved":
+        _handle_market_resolved_message(msg)
+        return  # No ticker update to enqueue
+    elif event_type == "new_market":
+        _handle_new_market_message(msg)
+        return  # No ticker update to enqueue
+    # Unknown types silently ignored
+
+    if not updates:
+        return
+
+    queue = _get_ticker_queue()
+    for u in updates:
+        try:
+            queue.put_nowait(u)
+        except asyncio.QueueFull:
+            logger.warning(
+                "[polymarket.stream] Ticker queue full, dropping update for token %s",
+                u.token_id,
+            )
+
+
 # ---------------------------------------------------------------------------
-# Market resolution check (Gamma API → Postgres)
+# Market resolution — Path A: direct WS-driven (no Gamma API)
+# ---------------------------------------------------------------------------
+
+async def _apply_ws_resolution(token_id: str, winning_outcome: str) -> None:
+    """
+    Apply a market_resolved event received directly from the WebSocket.
+
+    Skips the Gamma API roundtrip — uses winning_outcome provided by the WS event.
+    Guarded by _lifecycle_semaphore(3) to cap concurrent Supabase connections.
+    """
+    async with _lifecycle_semaphore:
+        try:
+            from sqlalchemy import select
+            from app.models.db import MarketOutcome
+
+            async with async_session_factory() as session:
+                result = await session.execute(
+                    select(Market.ext_id, Market.status)
+                    .join(MarketOutcome, MarketOutcome.market_id == Market.id)
+                    .where(
+                        MarketOutcome.execution_asset_id == token_id,
+                        Market.exchange == EXCHANGE,
+                        Market.is_deleted == False,
+                    )
+                )
+                row = result.first()
+
+            if not row:
+                return
+            condition_id, current_status = row
+
+            if current_status in ("resolved", "canceled"):
+                return
+
+            async with async_session_factory() as session:
+                await session.execute(
+                    update(Market)
+                    .where(Market.ext_id == condition_id, Market.exchange == EXCHANGE)
+                    .values(status="resolved", result=winning_outcome)
+                )
+                await session.commit()
+
+            logger.info(
+                "[polymarket.stream] WS resolution applied: %s → resolved (%s)",
+                condition_id, winning_outcome,
+            )
+
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error(
+                "[polymarket.stream] WS resolution apply failed for token %s: %s",
+                token_id, exc,
+            )
+
+
+# ---------------------------------------------------------------------------
+# Market resolution — Path B: Gamma API confirm (last_trade_price fallback)
 # ---------------------------------------------------------------------------
 
 async def _check_and_update_market_resolution(token_id: str) -> None:
     """
     Verify and persist market resolution for a token that hit settlement price.
+
+    Fallback path (Path B) — used when last_trade_price reaches settlement levels
+    but no market_resolved WS event has arrived. Queries Gamma API to confirm.
 
     1. Look up the market's conditionId from the DB via the token's execution_asset_id.
     2. Query the Gamma API for current market status.
@@ -334,8 +530,7 @@ async def _check_and_update_market_resolution(token_id: str) -> None:
     """
     async with _lifecycle_semaphore:
         try:
-            # Step 1: find the conditionId (market.ext_id) for this token
-            from sqlalchemy import select, text as sa_text
+            from sqlalchemy import select
             from app.models.db import MarketOutcome
 
             async with async_session_factory() as session:
@@ -358,7 +553,7 @@ async def _check_and_update_market_resolution(token_id: str) -> None:
             if current_status in ("resolved", "canceled"):
                 return
 
-            # Step 2: query Gamma API
+            # Query Gamma API
             async with httpx.AsyncClient(timeout=10.0) as client:
                 resp = await client.get(
                     f"{GAMMA_API_BASE}/markets",
@@ -371,7 +566,7 @@ async def _check_and_update_market_resolution(token_id: str) -> None:
                     return
                 mkt = markets_data[0]
 
-            # Step 3: determine new status and result
+            # Determine new status and result
             active = mkt.get("active", True)
             closed = mkt.get("closed", False)
             archived = mkt.get("archived", False)
@@ -394,7 +589,7 @@ async def _check_and_update_market_resolution(token_id: str) -> None:
             if new_status == current_status:
                 return
 
-            # Step 4: write to Postgres
+            # Write to Postgres
             async with async_session_factory() as session:
                 await session.execute(
                     update(Market)
@@ -407,7 +602,7 @@ async def _check_and_update_market_resolution(token_id: str) -> None:
                 await session.commit()
 
             logger.info(
-                "[polymarket.stream] Market %s resolved: status=%s result=%s",
+                "[polymarket.stream] Gamma-confirmed resolution: %s → %s (%s)",
                 condition_id, new_status, winning_outcome,
             )
 
@@ -431,8 +626,10 @@ async def _redis_flusher(redis_conn) -> None:
     Phase 1: HSET for all token ticker data in one pipeline.execute().
             Includes last_trade_price, last_trade_side, tick_size when present.
     Phase 2: ZADD events_trending_24h_polymarket for volume rollup.
-    Phase 3: Fire resolution check tasks for any settlement candidates detected
-            by the receive loop (non-blocking, semaphore-guarded).
+    Phase 3: Fire WS-driven resolution tasks (_ws_resolutions dict) — Path A,
+            no Gamma API roundtrip, outcome known from WS event.
+    Phase 4: Fire Gamma-confirm resolution tasks (_resolution_candidates) — Path B
+            fallback for last_trade_price settlement signals.
     """
     queue = _get_ticker_queue()
 
@@ -492,7 +689,18 @@ async def _redis_flusher(redis_conn) -> None:
                     pipe2.zadd("events_trending_24h_polymarket", {evt: vol})
                 await pipe2.execute()
 
-            # Phase 3: fire resolution checks for settlement candidates
+            # Phase 3: fire WS-driven resolution tasks (Path A — outcome known)
+            if _ws_resolutions:
+                ws_res = dict(_ws_resolutions)
+                _ws_resolutions.clear()
+                for tid, outcome in ws_res.items():
+                    asyncio.create_task(_apply_ws_resolution(tid, outcome))
+                logger.debug(
+                    "[polymarket.stream] Scheduled %d WS-driven resolution tasks",
+                    len(ws_res),
+                )
+
+            # Phase 4: fire Gamma-confirm resolution checks (Path B fallback)
             if _resolution_candidates:
                 candidates = list(_resolution_candidates)
                 _resolution_candidates.clear()
@@ -501,7 +709,7 @@ async def _redis_flusher(redis_conn) -> None:
                         _check_and_update_market_resolution(token_id)
                     )
                 logger.debug(
-                    "[polymarket.stream] Scheduled resolution checks for %d tokens",
+                    "[polymarket.stream] Scheduled %d Gamma resolution checks",
                     len(candidates),
                 )
 
@@ -527,13 +735,16 @@ async def run_polymarket_ws(token_ids: list[str]) -> None:
     """
     Main Polymarket CLOB WebSocket loop with exponential backoff reconnection.
 
-    Subscribes to the given ERC-1155 token IDs for:
+    Subscribes to the given ERC-1155 token IDs with custom_feature_enabled: true to get:
         - Real-time price/orderbook updates (book, price_change)
+        - Authoritative best bid/ask events (best_bid_ask)
         - Last trade price events with resolution detection (last_trade_price)
         - Tick size changes (tick_size_change)
+        - Direct market resolution events (market_resolved) — Path A
+        - New market notifications (new_market) — logged, ingested by reconciliation
 
     All messages flow through the micro-batching queue → Redis flusher.
-    Resolution signals are forwarded to the Gamma API + Postgres lifecycle handler.
+    Resolution: Path A (WS market_resolved) or Path B (last_trade_price → Gamma API).
 
     Runs as a long-lived asyncio task from FastAPI lifespan.
     """
@@ -549,7 +760,8 @@ async def run_polymarket_ws(token_ids: list[str]) -> None:
     flusher_task = asyncio.create_task(_redis_flusher(redis_conn))
     logger.info(
         "[polymarket.stream] Starting CLOB WebSocket for %d tokens "
-        "(price + lifecycle events, micro-batching flusher active)",
+        "(custom_feature_enabled: book, price_change, best_bid_ask, "
+        "last_trade_price, tick_size_change, market_resolved, new_market)",
         len(token_ids),
     )
 
@@ -569,11 +781,12 @@ async def run_polymarket_ws(token_ids: list[str]) -> None:
                     subscribe_msg = json.dumps({
                         "type": "market",
                         "assets_ids": token_ids,
+                        "custom_feature_enabled": True,
                     })
                     await ws.send(subscribe_msg)
                     logger.info(
                         "[polymarket.stream] Subscribed to %d tokens "
-                        "(book, price_change, last_trade_price, tick_size_change)",
+                        "(all event types, custom_feature_enabled=true)",
                         len(token_ids),
                     )
 
