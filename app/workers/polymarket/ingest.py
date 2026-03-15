@@ -145,6 +145,80 @@ def _infer_market_type(outcomes: list[str]) -> str:
     return "categorical"
 
 
+def _infer_series_format_type(series_dict: dict) -> str:
+    """
+    Heuristically classify a series' dominant market format.
+
+    Returns one of: 'binary', 'categorical', 'scalar'
+
+    Used only for DEV_MODE diversity selection — not stored in DB.
+
+    Rules (in priority order):
+      negRisk=true    → categorical  (Polymarket grouped mutual-exclusion markets)
+      slug/title has price/range keywords → scalar  (crypto price ladders, score ranges)
+      culture/award/nba/nfl in category   → categorical  (who wins the trophy/award)
+      default                             → binary  (yes/no question)
+    """
+    if series_dict.get("negRisk") or series_dict.get("neg_risk"):
+        return "categorical"
+
+    slug = (series_dict.get("slug") or "").lower()
+    title = (series_dict.get("title") or "").lower()
+
+    scalar_keywords = ("price", "hit", "reach", "above", "below", "range", "level", "high", "low")
+    if any(kw in slug or kw in title for kw in scalar_keywords):
+        return "scalar"
+
+    cats_lower = [c.lower() for c in _extract_category_labels(series_dict)]
+    categorical_cat_hints = {"culture", "entertainment", "music", "tv", "film", "award", "nba", "nfl", "sports"}
+    if any(any(h in cat for h in categorical_cat_hints) for cat in cats_lower):
+        return "categorical"
+
+    return "binary"
+
+
+def _select_diverse_series(
+    series_page: list[dict],
+    max_total: int = 20,
+    max_per_bucket: int = 2,
+) -> list[dict]:
+    """
+    Select a diverse subset of series across categories and market format types.
+
+    Groups series into (primary_category_slug, format_type) buckets, then does
+    max_per_bucket rounds of round-robin selection across all buckets — picking
+    one from each bucket per round — until max_total series are collected.
+
+    This guarantees representation across both category and format dimensions
+    without over-indexing on any single bucket.
+    """
+    from collections import defaultdict
+
+    buckets: dict[tuple[str, str], list[dict]] = defaultdict(list)
+    for s in series_page:
+        cats = _extract_category_labels(s)
+        primary_cat = slugify(cats[0]) if cats else "other"
+        fmt = _infer_series_format_type(s)
+        buckets[(primary_cat, fmt)].append(s)
+
+    selected: list[dict] = []
+    bucket_counters: dict[tuple[str, str], int] = defaultdict(int)
+    # Sort buckets for deterministic ordering (category asc, then format asc)
+    bucket_keys = sorted(buckets.keys())
+
+    for _round in range(max_per_bucket):
+        for bk in bucket_keys:
+            idx = bucket_counters[bk]
+            items = buckets[bk]
+            if idx < len(items):
+                selected.append(items[idx])
+                bucket_counters[bk] += 1
+                if len(selected) >= max_total:
+                    return selected
+
+    return selected
+
+
 def _infer_side(outcome_label: str) -> str:
     """Map outcome label to trade_side enum value."""
     label = outcome_label.lower().strip()
@@ -1212,58 +1286,81 @@ async def run_polymarket_state_reconciliation() -> dict:
 
 async def run_polymarket_dev_sync() -> list[str]:
     """
-    Sync the curated Polymarket DEV_MODE series targets from the Gamma API.
+    Sync a diverse set of active Polymarket series for DEV_MODE.
 
-    For each slug in POLYMARKET_DEV_SERIES_SLUGS:
-        1. Fetch series from Gamma /series?slug={slug}
-        2. Upsert series (id as ext_id, slug in platform_metadata, categories as JSONB list)
-        3. Upsert events (id as ext_id, slug in platform_metadata)
-        4. Upsert markets + outcomes (conditionId as ext_id, zip outcomes ↔ clobTokenIds)
+    Rather than hardcoded slugs (which go stale), fetches a large page of
+    currently-active series from the Gamma API and selects a diverse subset
+    across categories and market format types (binary / categorical / scalar).
+
+    Selection budget: up to 20 series, at most 2 per (category, format) bucket,
+    round-robined so every represented category gets a slot before any repeats.
+
+    Falls back to existing DB token IDs if the sync yields 0 tokens (e.g. all
+    active events for the selected series have since resolved between restarts).
 
     Populates POLYMARKET_DEV_TOKEN_IDS and POLYMARKET_DEV_EVENT_IDS.
     Returns the list of token IDs for WebSocket subscription.
     """
     from app.core.dev_config import (
-        POLYMARKET_DEV_SERIES_SLUGS,
         POLYMARKET_DEV_TOKEN_IDS,
         POLYMARKET_DEV_EVENT_IDS,
     )
 
+    _DEV_CANDIDATE_POOL = 200   # How many active series to fetch for selection
+    _DEV_SERIES_TARGET  = 20    # Max series to process
+    _DEV_PER_BUCKET     = 2     # Max series per (category, format) bucket
+
     logger.info(
-        "[polymarket.ingest] Starting DEV sync for %d target series",
-        len(POLYMARKET_DEV_SERIES_SLUGS),
+        "[polymarket.ingest] Starting DEV sync — fetching %d active series for diverse selection",
+        _DEV_CANDIDATE_POOL,
     )
     pool = await get_asyncpg_pool()
 
+    # 1. Fetch candidate pool of active series
+    series_page = await _fetch_active_series(limit=_DEV_CANDIDATE_POOL, offset=0)
+    if not series_page:
+        logger.warning("[polymarket.ingest] Gamma API returned no active series — aborting DEV sync")
+        return await load_polymarket_token_ids_from_db()
+
+    # 2. Select a diverse subset across (category, format_type) buckets
+    selected = _select_diverse_series(
+        series_page,
+        max_total=_DEV_SERIES_TARGET,
+        max_per_bucket=_DEV_PER_BUCKET,
+    )
+    logger.info(
+        "[polymarket.ingest] DEV sync: selected %d/%d series (diverse by category × format type)",
+        len(selected), len(series_page),
+    )
+    for s in selected:
+        cats = _extract_category_labels(s)
+        fmt = _infer_series_format_type(s)
+        logger.info(
+            "[polymarket.ingest]   → slug=%-40s  category=%-20s  format=%s",
+            s.get("slug", ""), (cats[0] if cats else "?"), fmt,
+        )
+
+    # 3. Upsert each selected series + its events/markets/outcomes
     all_token_ids: list[str] = []
     all_event_ids: list[str] = []
 
-    for slug in POLYMARKET_DEV_SERIES_SLUGS:
-        series_list = await _fetch_series_by_slug(slug)
+    for series_dict in selected:
+        try:
+            token_ids = await _process_series(pool, series_dict)
+            all_token_ids.extend(token_ids)
+            for event_dict in (series_dict.get("events") or []):
+                eid = str(event_dict.get("id", "")).strip()
+                if eid:
+                    all_event_ids.append(eid)
+        except Exception as exc:
+            logger.error(
+                "[polymarket.ingest] Error processing series id=%s slug=%s: %s",
+                series_dict.get("id"), series_dict.get("slug"), exc, exc_info=True,
+            )
 
-        if not series_list:
-            logger.warning("[polymarket.ingest] No series found for slug=%s — skipping", slug)
-            continue
-
-        for series_dict in series_list:
-            try:
-                token_ids = await _process_series(pool, series_dict)
-                all_token_ids.extend(token_ids)
-
-                # Collect event ext_ids from events nested in this series
-                for event_dict in (series_dict.get("events") or []):
-                    eid = str(event_dict.get("id", "")).strip()
-                    if eid:
-                        all_event_ids.append(eid)
-            except Exception as exc:
-                logger.error(
-                    "[polymarket.ingest] Error processing series slug=%s: %s",
-                    slug, exc, exc_info=True,
-                )
-
-    # Update mutable dev config lists
+    # 4. Populate mutable dev config lists (dedup, preserve order)
     POLYMARKET_DEV_TOKEN_IDS.clear()
-    POLYMARKET_DEV_TOKEN_IDS.extend(list(dict.fromkeys(all_token_ids)))  # dedup + preserve order
+    POLYMARKET_DEV_TOKEN_IDS.extend(list(dict.fromkeys(all_token_ids)))
 
     POLYMARKET_DEV_EVENT_IDS.clear()
     POLYMARKET_DEV_EVENT_IDS.extend(list(dict.fromkeys(all_event_ids)))
@@ -1274,7 +1371,20 @@ async def run_polymarket_dev_sync() -> list[str]:
         len(POLYMARKET_DEV_EVENT_IDS),
     )
 
-    # Sync tag taxonomy + sports metadata (non-blocking — log failure but don't abort)
+    # 5. If sync yielded nothing (all selected series have resolved markets),
+    #    fall back to existing DB tokens so the WS still subscribes to something.
+    if not POLYMARKET_DEV_TOKEN_IDS:
+        logger.warning(
+            "[polymarket.ingest] DEV sync yielded 0 token IDs — "
+            "falling back to existing DB tokens for WS subscription"
+        )
+        db_tokens = await load_polymarket_token_ids_from_db()
+        POLYMARKET_DEV_TOKEN_IDS.extend(db_tokens)
+        logger.info(
+            "[polymarket.ingest] DB fallback: %d token IDs loaded", len(db_tokens)
+        )
+
+    # 6. Sync tag taxonomy + sports metadata (non-blocking)
     try:
         tag_stats = await run_polymarket_tag_sync(pool)
         logger.info(

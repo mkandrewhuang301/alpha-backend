@@ -38,7 +38,7 @@ async def manual_dev_sync(
     Trigger a restricted sync for the specified exchange.
 
     - kalshi:      syncs DEV_TARGET_SERIES from Kalshi, updates DEV_TARGET_MARKETS
-    - polymarket:  syncs POLYMARKET_DEV_SERIES_SLUGS, updates POLYMARKET_DEV_TOKEN_IDS
+    - polymarket:  fetches active series dynamically, selects diverse subset, updates POLYMARKET_DEV_TOKEN_IDS
 
     Only available when DEV_MODE=True. Returns 403 in production.
     """

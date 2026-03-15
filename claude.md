@@ -264,7 +264,6 @@ alpha-backend/
 │   └── core/
 │       ├── config.py                # Loads all env variables (including DEV_MODE)
 │       ├── dev_config.py            # DEV_MODE sandbox constants:
-│       │                            #   POLYMARKET_DEV_SERIES_SLUGS (5 curated slugs)
 │       │                            #   DEV_EXPLICIT_SERIES (Kalshi series dict, currently all commented out)
 │       │                            #   DEV_TARGET_SERIES, DEV_TARGET_MARKETS (populated at startup)
 │       │                            #   POLYMARKET_DEV_TOKEN_IDS, POLYMARKET_DEV_EVENT_IDS
@@ -431,17 +430,11 @@ Full SQL schema is in `/schema.sql`. ORM models live in `app/models/db.py`.
 
 **When DEV_MODE=True:**
 - **Kalshi**: All Kalshi sync and WebSocket are disabled. `DEV_EXPLICIT_SERIES` dict is defined but all entries are commented out. `DEV_TARGET_SERIES` and `DEV_TARGET_MARKETS` remain empty.
-- **Polymarket startup**: `run_polymarket_dev_sync()` runs as a background `asyncio.create_task` — server starts immediately while sync runs in background. Syncs the 5 slugs in `POLYMARKET_DEV_SERIES_SLUGS`, caps at 4 events per series. After sync completes, builds token→event map and starts Polymarket CLOB WS.
-- **Dev config**: `app/core/dev_config.py` defines `POLYMARKET_DEV_SERIES_SLUGS` (5 curated slugs), `DEV_REDIS_FLUSH_INTERVAL` (0.5s), mutable `POLYMARKET_DEV_TOKEN_IDS` + `POLYMARKET_DEV_EVENT_IDS` (populated at startup)
+- **Polymarket startup**: `run_polymarket_dev_sync()` runs as a background `asyncio.create_task` — server starts immediately while sync runs in background. Fetches 200 active series from Gamma API, selects up to 20 diverse series across (category × format_type) buckets (max 2 per bucket), caps at 4 events per series. Falls back to DB token IDs if sync yields 0. After sync completes, builds token→event map and starts Polymarket CLOB WS.
+- **Dev config**: `app/core/dev_config.py` defines `DEV_REDIS_FLUSH_INTERVAL` (0.5s), mutable `POLYMARKET_DEV_TOKEN_IDS` + `POLYMARKET_DEV_EVENT_IDS` (populated at startup). No hardcoded slugs — series selected dynamically.
+- **Polymarket DEV diversity logic**: `_infer_series_format_type()` classifies each series as `binary` / `categorical` / `scalar` using negRisk flag, slug/title keywords, and category hints. `_select_diverse_series()` groups into (category, format) buckets and round-robins to maximize variety.
 - **arq crons**: Only `run_polymarket_state_reconciliation` (every 2 minutes). All Kalshi crons disabled. **arq worker process is still required in DEV_MODE** — run `arq app.core.arq_worker.WorkerSettings` alongside uvicorn.
 - **Dev endpoint**: `POST /api/v1/dev/sync/{exchange}` — returns 403 in prod
-
-**Polymarket DEV series (5 slugs in `POLYMARKET_DEV_SERIES_SLUGS`):**
-- `trump-approval-positive` — Politics, binary approval rating
-- `trump-negative-approval` — Politics
-- `us-annual-inflation` — Economics, recurring monthly
-- `unemployment` — Economics
-- `solana-hit-price-monthly` — Crypto, price range markets
 
 **When DEV_MODE=False (production):**
 - Polymarket WS: loads all token IDs from DB immediately, subscribes to full production set
