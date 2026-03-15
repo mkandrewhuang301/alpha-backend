@@ -27,6 +27,7 @@ Zipping outcomes:
     We zip them together to create one MarketOutcome row per (outcome, token) pair.
 """
 
+import asyncio
 import json as _json
 import logging
 import uuid
@@ -36,6 +37,7 @@ from typing import Optional
 
 import httpx
 
+from app.core.config import DEV_MODE
 from app.core.database import get_asyncpg_pool
 from app.models.polymarket import map_polymarket_status
 from app.workers.taxonomy import (
@@ -432,7 +434,7 @@ async def _upsert_event(
         return None
 
     # Upsert PlatformTags for categories.
-    # Top-level category has no parent; subcategory links to parent via parent_id.
+    # Top-level category has no parent; subcategory links to parent via parent_ids.
     if raw_category:
         await upsert_platform_tag(
             pool, EXCHANGE, "category",
@@ -444,7 +446,7 @@ async def _upsert_event(
             pool, EXCHANGE, "category",
             slug=slugify(raw_subcategory),
             label=raw_subcategory,
-            parent_id=slugify(raw_category) if raw_category else None,
+            parent_ids=[slugify(raw_category)] if raw_category else [],
         )
 
     # Upsert PlatformTags for tags
@@ -641,6 +643,277 @@ async def _upsert_market_with_outcomes(
 
 
 # ---------------------------------------------------------------------------
+# Tag taxonomy fetch helpers
+# ---------------------------------------------------------------------------
+
+async def _fetch_all_tags(page_size: int = 100) -> list[dict]:
+    """Fetch all Polymarket tags from GET /tags with pagination."""
+    all_tags: list[dict] = []
+    offset = 0
+    try:
+        async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as client:
+            while True:
+                resp = await client.get(
+                    f"{GAMMA_API_BASE}/tags",
+                    params={"limit": page_size, "offset": offset},
+                )
+                if resp.status_code != 200:
+                    logger.warning(
+                        "[polymarket.ingest] GET /tags returned %d at offset=%d",
+                        resp.status_code, offset,
+                    )
+                    break
+                data = resp.json()
+                if not isinstance(data, list) or not data:
+                    break
+                all_tags.extend(data)
+                if len(data) < page_size:
+                    break
+                offset += page_size
+    except Exception as exc:
+        logger.error("[polymarket.ingest] Error fetching /tags: %s", exc)
+    return all_tags
+
+
+async def _fetch_tag_children(tag_id: str) -> list[dict]:
+    """
+    Fetch child tags for a given parent tag ID from GET /tags/{id}/related-tags/tags.
+    Retries up to 3 times with exponential backoff on HTTP 429 (rate-limited).
+    """
+    backoff = 2.0
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as client:
+                resp = await client.get(
+                    f"{GAMMA_API_BASE}/tags/{tag_id}/related-tags/tags"
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    return data if isinstance(data, list) else []
+                elif resp.status_code == 429:
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(backoff)
+                        backoff *= 2.0
+                    # else fall through to final return below
+                else:
+                    return []
+        except Exception as exc:
+            logger.warning(
+                "[polymarket.ingest] tag children fetch error tag_id=%s: %s", tag_id, exc
+            )
+            return []
+    logger.warning(
+        "[polymarket.ingest] Rate-limited for tag_id=%s after %d attempts — skipping",
+        tag_id, max_retries,
+    )
+    return []
+
+
+async def _fetch_sports() -> list[dict]:
+    """Fetch sports metadata from GET /sports."""
+    try:
+        async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as client:
+            resp = await client.get(f"{GAMMA_API_BASE}/sports")
+            if resp.status_code != 200:
+                logger.warning(
+                    "[polymarket.ingest] GET /sports returned %d", resp.status_code
+                )
+                return []
+            data = resp.json()
+            return data if isinstance(data, list) else []
+    except Exception as exc:
+        logger.error("[polymarket.ingest] Error fetching /sports: %s", exc)
+        return []
+
+
+# ---------------------------------------------------------------------------
+# Tag taxonomy upserts
+# ---------------------------------------------------------------------------
+
+async def _upsert_polymarket_tags(pool, tags: list[dict]) -> int:
+    """
+    Upsert Polymarket Gamma API tags into platform_tags (exchange='polymarket', type='tag').
+
+    Each dict must have keys: id, label, slug, is_carousel, force_show,
+    force_hide, parent_ids.
+
+    Uses (exchange, slug, type) unique constraint. Tags with no slug fall back
+    to slugify(label). Original Polymarket tag ID stored in platform_metadata.
+    """
+    if not tags:
+        return 0
+
+    count = 0
+    for t in tags:
+        tag_id = t.get("id")
+        if not tag_id:
+            continue
+        label = t.get("label") or ""
+        raw_slug = t.get("slug") or ""
+        slug = raw_slug.strip() or slugify(label) if label else ""
+        if not slug or not label:
+            continue
+        await upsert_platform_tag(
+            pool,
+            exchange=EXCHANGE,
+            tag_type="tag",
+            slug=slug,
+            label=label,
+            ext_id=str(tag_id),
+            parent_ids=t.get("parent_ids", []),
+            is_carousel=bool(t.get("is_carousel", False)),
+            force_show=bool(t.get("force_show", False)),
+            force_hide=bool(t.get("force_hide", False)),
+            platform_metadata={"polymarket_id": str(tag_id)},
+        )
+        count += 1
+    return count
+
+
+async def _upsert_polymarket_sports(pool, sports: list[dict]) -> int:
+    """
+    Upsert sports metadata into sports_metadata (exchange='polymarket').
+
+    The API 'tags' field is a comma-separated string of tag IDs — split into array.
+    Uses (exchange, sport) unique constraint.
+    """
+    if not sports:
+        return 0
+    rows = []
+    for sport in sports:
+        sport_name = str(sport.get("sport") or sport.get("name") or "").strip()
+        if not sport_name:
+            continue
+        tags_raw = sport.get("tags") or ""
+        if isinstance(tags_raw, str):
+            tag_ids = [t.strip() for t in tags_raw.split(",") if t.strip()]
+        elif isinstance(tags_raw, list):
+            tag_ids = [str(t).strip() for t in tags_raw if str(t).strip()]
+        else:
+            tag_ids = []
+        rows.append((
+            str(uuid.uuid4()),
+            EXCHANGE,
+            sport_name,
+            sport.get("series") or sport.get("seriesSlug"),
+            sport.get("resolutionOracleURI") or sport.get("resolution_oracle_uri"),
+            tag_ids,
+        ))
+    if not rows:
+        return 0
+    try:
+        async with pool.acquire() as conn:
+            await conn.executemany(
+                """
+                INSERT INTO sports_metadata
+                    (id, exchange, sport, series_slug, resolution_url, tag_ids, updated_at)
+                VALUES ($1::uuid, $2::exchange_type, $3, $4, $5, $6::text[], NOW())
+                ON CONFLICT ON CONSTRAINT uq_sports_metadata_exchange_sport DO UPDATE SET
+                    series_slug = EXCLUDED.series_slug,
+                    resolution_url = EXCLUDED.resolution_url,
+                    tag_ids = EXCLUDED.tag_ids,
+                    updated_at = NOW()
+                """,
+                rows,
+            )
+    except Exception as exc:
+        logger.error(
+            "[polymarket.ingest] Failed to upsert sports_metadata: %s", exc
+        )
+        return 0
+    return len(rows)
+
+
+async def run_polymarket_tag_sync(pool) -> dict:
+    """
+    Sync the complete Polymarket tag taxonomy with parent-child relationships.
+
+    Steps:
+        1. Fetch all tags from GET /tags (paginated)
+        2. For each top-level tag, fetch children from GET /tags/{id}/related-tags/tags
+           (concurrent, semaphore-limited to avoid API overload)
+        3. Accumulate parent_ids for each child tag
+        4. Upsert all tags into polymarket_tags (GIN-indexed parent_ids array)
+        5. Fetch and upsert sports metadata from GET /sports
+
+    Returns a stats dict.
+    """
+    logger.info("[polymarket.ingest] Starting tag taxonomy sync...")
+
+    # Step 1: Fetch all top-level tags
+    raw_tags = await _fetch_all_tags()
+    logger.info("[polymarket.ingest] Fetched %d tags from /tags", len(raw_tags))
+
+    # Build initial tag map: {id_str → tag_data_dict}
+    tags_map: dict[str, dict] = {}
+    for tag in raw_tags:
+        tag_id = str(tag.get("id", "")).strip()
+        if not tag_id:
+            continue
+        tags_map[tag_id] = {
+            "id": tag_id,
+            "label": tag.get("label"),
+            "slug": tag.get("slug"),
+            "is_carousel": bool(tag.get("isCarousel", False)),
+            "force_show": bool(tag.get("forceShow", False)),
+            "force_hide": bool(tag.get("forceHide", False)),
+            "parent_ids": [],
+        }
+
+    # Step 2: Fetch children for each top-level tag (concurrently, 3 at a time).
+    # The Gamma API rate-limits aggressively; _fetch_tag_children already retries on
+    # 429 with backoff, so keeping concurrency low avoids wasteful retry storms.
+    sem = asyncio.Semaphore(3)
+
+    async def _fetch_children_guarded(parent_id: str):
+        async with sem:
+            children = await _fetch_tag_children(parent_id)
+            return parent_id, children
+
+    parent_ids = list(tags_map.keys())
+    results = await asyncio.gather(
+        *[_fetch_children_guarded(pid) for pid in parent_ids],
+        return_exceptions=True,
+    )
+
+    for result in results:
+        if isinstance(result, Exception):
+            logger.warning("[polymarket.ingest] Tag children fetch error: %s", result)
+            continue
+        parent_id, children = result
+        for child in children:
+            child_id = str(child.get("id", "")).strip()
+            if not child_id:
+                continue
+            if child_id not in tags_map:
+                tags_map[child_id] = {
+                    "id": child_id,
+                    "label": child.get("label"),
+                    "slug": child.get("slug"),
+                    "is_carousel": bool(child.get("isCarousel", False)),
+                    "force_show": bool(child.get("forceShow", False)),
+                    "force_hide": bool(child.get("forceHide", False)),
+                    "parent_ids": [],
+                }
+            if parent_id not in tags_map[child_id]["parent_ids"]:
+                tags_map[child_id]["parent_ids"].append(parent_id)
+
+    # Step 3: Upsert all tags
+    tag_count = await _upsert_polymarket_tags(pool, list(tags_map.values()))
+    logger.info("[polymarket.ingest] Upserted %d tags into platform_tags (polymarket)", tag_count)
+
+    # Step 4: Fetch and upsert sports metadata
+    sports = await _fetch_sports()
+    sport_count = await _upsert_polymarket_sports(pool, sports)
+    logger.info(
+        "[polymarket.ingest] Upserted %d rows into sports_metadata (polymarket)", sport_count
+    )
+
+    return {"tags": tag_count, "sports": sport_count}
+
+
+# ---------------------------------------------------------------------------
 # Process a full series dict (series + its events + their markets)
 # ---------------------------------------------------------------------------
 
@@ -664,6 +937,14 @@ async def _process_series(pool, series_dict: dict) -> list[str]:
     events = series_dict.get("events") or []
     if not events and series_id_str:
         events = await _fetch_series_events(series_id_str)
+
+    # In DEV_MODE, cap at 4 events per series to avoid long sync times
+    if DEV_MODE and len(events) > 4:
+        events = events[:4]
+        logger.info(
+            "[polymarket.ingest] DEV_MODE: capped to 4 events for series id=%s slug=%s",
+            series_id_str, slug,
+        )
 
     # 3. Upsert each event and its markets
     for event_dict in events:
@@ -791,6 +1072,141 @@ async def build_token_event_map() -> dict[str, str]:
 
 
 # ---------------------------------------------------------------------------
+# State reconciliation (periodic delta sync for market status / resolution)
+# ---------------------------------------------------------------------------
+
+async def run_polymarket_state_reconciliation() -> dict:
+    """
+    Delta sync: check Polymarket markets for status/resolution changes.
+
+    Queries the Gamma API for recently closed/resolved markets and updates
+    their status and result in the DB. Intended as a periodic arq cron job
+    (every 5 minutes in production).
+
+    Returns a stats dict: {"checked": N, "updated": N}.
+    """
+    logger.info("[polymarket.ingest] Starting state reconciliation...")
+    pool = await get_asyncpg_pool()
+    checked = 0
+    updated = 0
+
+    try:
+        # Pull all non-resolved polymarket markets from our DB
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT m.id, m.ext_id, m.status, e.ext_id AS event_ext_id
+                FROM markets m
+                JOIN events e ON m.event_id = e.id
+                WHERE m.exchange = 'polymarket'
+                  AND m.is_deleted = FALSE
+                  AND m.status NOT IN ('resolved', 'canceled')
+                ORDER BY m.updated_at ASC
+                LIMIT 200
+                """
+            )
+
+        if not rows:
+            logger.info("[polymarket.ingest] State reconciliation: no active markets found.")
+            return {"checked": 0, "updated": 0}
+
+        # Batch conditionIds into Gamma API requests (max 20 per call)
+        condition_ids = [r["ext_id"] for r in rows]
+        checked = len(condition_ids)
+        db_status_map = {r["ext_id"]: r["status"] for r in rows}
+
+        batch_size = 20
+        updates: list[tuple] = []  # (condition_id, new_status, result)
+
+        async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as client:
+            for i in range(0, len(condition_ids), batch_size):
+                batch = condition_ids[i : i + batch_size]
+                # Gamma API accepts multiple conditionIds via repeated param
+                try:
+                    resp = await client.get(
+                        f"{GAMMA_API_BASE}/markets",
+                        params=[("conditionId", cid) for cid in batch],
+                    )
+                    if resp.status_code != 200:
+                        logger.warning(
+                            "[polymarket.ingest] Gamma /markets batch returned %d",
+                            resp.status_code,
+                        )
+                        continue
+                    markets = resp.json()
+                    if not isinstance(markets, list):
+                        continue
+
+                    for mkt in markets:
+                        condition_id = mkt.get("conditionId") or mkt.get("condition_id") or ""
+                        if not condition_id or condition_id not in db_status_map:
+                            continue
+
+                        active = mkt.get("active", True)
+                        closed = mkt.get("closed", False)
+                        archived = mkt.get("archived", False)
+
+                        if closed or archived:
+                            raw_status = "closed"
+                        elif active:
+                            raw_status = "open"
+                        else:
+                            raw_status = "closed"
+
+                        new_status = map_polymarket_status(raw_status)
+
+                        # Detect resolution: check if any token is a winner
+                        tokens = mkt.get("tokens") or []
+                        winning_outcome = next(
+                            (t.get("outcome") for t in tokens if t.get("winner")),
+                            None,
+                        )
+                        if winning_outcome:
+                            new_status = "resolved"
+
+                        if new_status != db_status_map.get(condition_id):
+                            updates.append((condition_id, new_status, winning_outcome))
+
+                except Exception as exc:
+                    logger.warning(
+                        "[polymarket.ingest] Batch reconciliation error: %s", exc
+                    )
+                    continue
+
+        # Apply updates
+        if updates:
+            now = datetime.now(timezone.utc)
+            async with pool.acquire() as conn:
+                await conn.executemany(
+                    """
+                    UPDATE markets
+                    SET status = $2::market_status,
+                        result = $3,
+                        updated_at = $4
+                    WHERE exchange = 'polymarket'
+                      AND ext_id = $1
+                      AND is_deleted = FALSE
+                    """,
+                    [(cid, status, result, now) for cid, status, result in updates],
+                )
+            updated = len(updates)
+            logger.info(
+                "[polymarket.ingest] State reconciliation: updated %d / %d markets",
+                updated, checked,
+            )
+        else:
+            logger.info(
+                "[polymarket.ingest] State reconciliation: %d markets checked, none changed.",
+                checked,
+            )
+
+    except Exception as exc:
+        logger.error("[polymarket.ingest] State reconciliation failed: %s", exc, exc_info=True)
+
+    return {"checked": checked, "updated": updated}
+
+
+# ---------------------------------------------------------------------------
 # Main sync entry points
 # ---------------------------------------------------------------------------
 
@@ -857,6 +1273,17 @@ async def run_polymarket_dev_sync() -> list[str]:
         len(POLYMARKET_DEV_TOKEN_IDS),
         len(POLYMARKET_DEV_EVENT_IDS),
     )
+
+    # Sync tag taxonomy + sports metadata (non-blocking — log failure but don't abort)
+    try:
+        tag_stats = await run_polymarket_tag_sync(pool)
+        logger.info(
+            "[polymarket.ingest] Tag taxonomy synced: %d tags, %d sports",
+            tag_stats["tags"], tag_stats["sports"],
+        )
+    except Exception as exc:
+        logger.warning("[polymarket.ingest] Tag taxonomy sync failed (non-critical): %s", exc)
+
     return list(POLYMARKET_DEV_TOKEN_IDS)
 
 

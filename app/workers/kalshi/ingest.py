@@ -201,7 +201,7 @@ async def sync_series() -> int:
         "[kalshi.ingest] Upserted %d category platform_tags from series", len(seen_categories),
     )
 
-    # Use SearchAPI to get all tags per category, upsert each tag with parent_id
+    # Use SearchAPI to get all tags per category, upsert each tag with parent_ids
     # linking it to its parent category slug.
     tags_by_category = await get_tags_for_series_categories()
     tag_count = 0
@@ -214,7 +214,7 @@ async def sync_series() -> int:
                 pool, EXCHANGE, "tag",
                 slug=slugify(tag_label),
                 label=tag_label,
-                parent_id=category_slug,
+                parent_ids=[category_slug],
             )
             tag_count += 1
     logger.info("[kalshi.ingest] Upserted %d tag platform_tags from SearchAPI", tag_count)
@@ -1052,7 +1052,7 @@ async def run_kalshi_dev_sync() -> None:
                 label=s.category,
             )
 
-    # Use SearchAPI to get all tags per category, upsert each with parent_id link
+    # Use SearchAPI to get all tags per category, upsert each with parent_ids link
     tags_by_category = await get_tags_for_series_categories()
     for category_name, tag_labels in tags_by_category.items():
         category_slug = slugify(category_name)
@@ -1063,7 +1063,7 @@ async def run_kalshi_dev_sync() -> None:
                 pool, EXCHANGE, "tag",
                 slug=slugify(tag_label),
                 label=tag_label,
-                parent_id=category_slug,
+                parent_ids=[category_slug],
             )
 
     target_series_tickers = [s.ticker for s in selected_series]

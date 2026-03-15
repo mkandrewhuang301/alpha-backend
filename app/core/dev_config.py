@@ -23,25 +23,25 @@ from typing import Dict, List
 # Explicit series tickers to track in DEV_MODE, organized by category.
 # These are fixed tickers chosen to test specific UI/data edge cases.
 DEV_EXPLICIT_SERIES: Dict[str, List[str]] = {
-    "Politics": [
-        "KXNEXTIRANLEADER",    # Tests early settlement logic
-        "KXDHSFUND",            # Tests cascading rolling deadlines within an event
-        "KXLOSEREELECTIONGOV", # Tests quantitative integer threshold UIs
-    ],
-    "Economics": [
-        "KXFEDDECISION",        # Tests standard categorical grouping
-        "KXINXY",               # Tests scalar price ranges and ladder arrays
-        "KXISMPMI",             # Tests directional "At least X" floor logic
-    ],
-    "Tech/Corporate": [
-        "KXIPO",                # Tests unpredictable asynchronous external settlement sources
-        "KXGAMEAWARDS",         # Tests heavy categorical media and image ingestion
-    ],
-    "Climate/Mentions": [
-        "KXNYTHEAD",            # Tests cumulative directional tallying arrays
-        "KXHMONTH",             # Tests long-duration monthly polling epochs
-        "KXWARMING",            # Tests PostgreSQL boundary logic for decadal 2050 timestamps
-    ],
+    # "Politics": [
+    #     "KXNEXTIRANLEADER",    # Tests early settlement logic
+    #     "KXDHSFUND",            # Tests cascading rolling deadlines within an event
+    #     "KXLOSEREELECTIONGOV", # Tests quantitative integer threshold UIs
+    # ],
+    # "Economics": [
+    #     "KXFEDDECISION",        # Tests standard categorical grouping
+    #     "KXINXY",               # Tests scalar price ranges and ladder arrays
+    #     "KXISMPMI",             # Tests directional "At least X" floor logic
+    # ],
+    # "Tech/Corporate": [
+    #     "KXIPO",                # Tests unpredictable asynchronous external settlement sources
+    #     "KXGAMEAWARDS",         # Tests heavy categorical media and image ingestion
+    # ],
+    # "Climate/Mentions": [
+    #     "KXNYTHEAD",            # Tests cumulative directional tallying arrays
+    #     "KXHMONTH",             # Tests long-duration monthly polling epochs
+    #     "KXWARMING",            # Tests PostgreSQL boundary logic for decadal 2050 timestamps
+    # ],
 }
 
 # Flat list of all explicit series tickers (for convenience)
@@ -81,7 +81,7 @@ DEV_TARGET_MARKETS: List[str] = []
 #   Culture:     Billboard #1 song (categorical, multiple-choice)
 POLYMARKET_DEV_SERIES_SLUGS: List[str] = [
     # Politics — binary approval rating (2–4 events, clean binary market)
-    "trump-approval-positve",
+    "trump-approval-positive",
     "trump-negative-approval",
     # Economics — recurring monthly data series
     "us-annual-inflation",

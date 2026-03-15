@@ -1,16 +1,16 @@
 """
 PlatformTags endpoints — taxonomy UI metadata for both exchanges.
 
-GET /categories/platform-tags/       - list tags filterable by exchange, type, parent_id
+GET /categories/platform-tags/       - list tags filterable by exchange, type, parent_ids
 GET /categories/platform-tags/{id}   - single tag by UUID
 """
 
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, ConfigDict
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
@@ -28,14 +28,16 @@ class PlatformTagResponse(BaseModel):
 
     id: UUID
     exchange: str
-    type: str                           # "category" | "tag"
+    type: str                               # "category" | "tag"
     ext_id: str
-    parent_id: Optional[str] = None    # Parent category slug (for subcategories/tags)
-    slug: str                           # The critical link to Event/Series ARRAY columns
-    label: str                          # UI display text
+    parent_ids: List[str] = []              # Parent slugs/IDs (multi-parent support)
+    slug: str                               # The critical link to Event/Series ARRAY columns
+    label: str                              # UI display text
     image_url: Optional[str] = None
     is_carousel: bool = False
     force_show: bool = False
+    force_hide: bool = False
+    platform_metadata: Optional[Dict[str, Any]] = None
 
 
 class PlatformTagListResponse(BaseModel):
@@ -53,12 +55,14 @@ def _platform_tag_to_response(row: PlatformTag) -> PlatformTagResponse:
         exchange=row.exchange,
         type=row.type,
         ext_id=row.ext_id,
-        parent_id=row.parent_id,
+        parent_ids=row.parent_ids or [],
         slug=row.slug,
         label=row.label,
         image_url=row.image_url,
         is_carousel=row.is_carousel,
         force_show=row.force_show,
+        force_hide=row.force_hide,
+        platform_metadata=row.platform_metadata,
     )
 
 
@@ -70,7 +74,7 @@ def _platform_tag_to_response(row: PlatformTag) -> PlatformTagResponse:
 async def list_platform_tags(
     exchange: Optional[str] = Query(default=None, description="Filter by exchange: 'kalshi' | 'polymarket'"),
     type: Optional[str] = Query(default=None, description="Filter by type: 'category' | 'tag'"),
-    parent_id: Optional[str] = Query(default=None, description="Filter by parent_id slug. Pass empty string for top-level items."),
+    parent_id: Optional[str] = Query(default=None, description="Filter by parent slug/ID (containment). Pass empty string for top-level items with no parents."),
     is_carousel: Optional[bool] = Query(default=None, description="Filter to carousel items only"),
     db: AsyncSession = Depends(get_db),
 ) -> PlatformTagListResponse:
@@ -80,10 +84,10 @@ async def list_platform_tags(
     The `slug` field in each result matches slug strings stored in
     Series.categories, Series.tags, Event.categories, and Event.tags.
 
-    - `type=category` — top-level category items (parent_id=null) or subcategories (parent_id set)
-    - `type=tag` — tag items; `parent_id` links to the parent category slug
-    - `parent_id=<slug>` — filter to children of a given category
-    - `parent_id=` (empty string) — filter to top-level items (no parent)
+    - `type=category` — top-level category items (parent_ids=[]) or subcategories
+    - `type=tag` — tag items; `parent_ids` links to the parent category slugs
+    - `parent_id=<slug>` — filter to children of a given parent (array containment)
+    - `parent_id=` (empty string) — filter to top-level items (parent_ids is empty)
     - `is_carousel=true` — items flagged for carousel display
     """
     stmt = select(PlatformTag).where(PlatformTag.is_deleted == False)
@@ -94,9 +98,15 @@ async def list_platform_tags(
         stmt = stmt.where(PlatformTag.type == type)
     if parent_id is not None:
         if parent_id == "":
-            stmt = stmt.where(PlatformTag.parent_id == None)
+            # Top-level: parent_ids is null or empty array
+            stmt = stmt.where(
+                (PlatformTag.parent_ids == None) | (PlatformTag.parent_ids == [])
+            )
         else:
-            stmt = stmt.where(PlatformTag.parent_id == parent_id)
+            # Children of a specific parent — GIN array containment
+            stmt = stmt.where(
+                PlatformTag.parent_ids.contains([parent_id])
+            )
     if is_carousel is not None:
         stmt = stmt.where(PlatformTag.is_carousel == is_carousel)
 

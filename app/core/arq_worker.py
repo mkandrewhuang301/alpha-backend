@@ -4,10 +4,15 @@ arq worker configuration — replaces APScheduler.
 Run as a separate process:
     arq app.core.arq_worker.WorkerSettings
 
-Cron jobs:
+Cron jobs (DEV_MODE):
+    - polymarket_state_reconciliation: every 2 minutes
+
+Cron jobs (production):
     - kalshi_full_sync: every 15 minutes (full backfill)
     - kalshi_state_reconciliation: every 1 minute (delta sync)
     - aggregate_ohlcv: every 1 minute (Redis ticks → 1m candles in Postgres)
+    - aggregate_event_volumes: every 5 minutes
+    - polymarket_state_reconciliation: every 2 minutes
 """
 
 import logging
@@ -84,19 +89,31 @@ async def run_aggregate_event_volumes(ctx: dict) -> None:
     await aggregate_event_volumes(ctx)
 
 
+async def run_polymarket_state_reconciliation(ctx: dict) -> None:
+    """Periodic delta sync: check Polymarket market status/resolution changes."""
+    from app.workers.polymarket.ingest import run_polymarket_state_reconciliation as _sync
+    await _sync()
+
+
 class WorkerSettings:
     functions = [
         run_kalshi_full_sync,
         run_kalshi_state_reconciliation,
         run_aggregate_ohlcv,
         run_aggregate_event_volumes,
+        run_polymarket_state_reconciliation,
     ]
-    # In DEV_MODE all crons are disabled — use POST /api/v1/dev/sync-kalshi instead.
-    cron_jobs = [] if DEV_MODE else [
+    # DEV_MODE: only Polymarket reconciliation (Kalshi sync/streaming disabled in dev).
+    # PROD: full suite of Kalshi + Polymarket crons.
+    _every_2_min = {0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30, 32, 34, 36, 38, 40, 42, 44, 46, 48, 50, 52, 54, 56, 58}
+    cron_jobs = [
+        cron(run_polymarket_state_reconciliation, minute=_every_2_min),
+    ] if DEV_MODE else [
         cron(run_kalshi_full_sync, minute={0, 15, 30, 45}),
         cron(run_kalshi_state_reconciliation, minute=set(range(60)), unique=True),
         cron(run_aggregate_ohlcv, minute=set(range(60)), unique=True),
         cron(run_aggregate_event_volumes, minute={0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55}),
+        cron(run_polymarket_state_reconciliation, minute=_every_2_min),
     ]
     on_startup = startup
     on_shutdown = shutdown

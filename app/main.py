@@ -26,7 +26,7 @@ from app.api.routes.v1 import dev as v1_dev
 from app.core.config import DEV_MODE
 from app.core.database import init_db, init_asyncpg_pool, close_asyncpg_pool
 from app.core.redis import get_redis, close_redis
-from app.workers.kalshi.stream import run_kalshi_ws
+# from app.workers.kalshi.stream import run_kalshi_ws  # Kalshi streaming disabled
 from app.workers.polymarket.stream import run_polymarket_ws, set_token_event_map
 
 logging.basicConfig(
@@ -54,12 +54,11 @@ async def lifespan(app: FastAPI):
     logger.info("Connection pools ready (asyncpg + Redis).")
 
     if DEV_MODE:
-        # DEV_MODE: Kalshi sync is fast (~30s); run it synchronously so the
-        # WS subscribes to the right markets immediately.
-        logger.info("DEV_MODE=True — running restricted Kalshi sync (curated series)...")
-        from app.workers.kalshi.ingest import run_kalshi_dev_sync
-        await run_kalshi_dev_sync()
-        logger.info("DEV_MODE Kalshi sync complete.")
+        # Kalshi DEV sync commented out — only Polymarket data is active.
+        # logger.info("DEV_MODE=True — running restricted Kalshi sync (curated series)...")
+        # from app.workers.kalshi.ingest import run_kalshi_dev_sync
+        # await run_kalshi_dev_sync()
+        # logger.info("DEV_MODE Kalshi sync complete.")
 
         # Polymarket sync is slow (Gamma API ~10s/event, 50+ events total).
         # Run it as a background task so the server starts accepting requests
@@ -92,9 +91,10 @@ async def lifespan(app: FastAPI):
         set_token_event_map(token_event_map)
         logger.info("Polymarket token→event map populated (%d entries).", len(token_event_map))
 
-    # Start Kalshi WebSocket firehose as background task
-    ws_task = asyncio.create_task(run_kalshi_ws())
-    logger.info("Kalshi WebSocket firehose started (mode=%s).", "dev" if DEV_MODE else "prod")
+    # Kalshi WebSocket firehose disabled — only Polymarket streaming active.
+    # ws_task = asyncio.create_task(run_kalshi_ws())
+    # logger.info("Kalshi WebSocket firehose started (mode=%s).", "dev" if DEV_MODE else "prod")
+    ws_task = None  # Kalshi WS disabled
 
     if not DEV_MODE:
         polymarket_ws_task = asyncio.create_task(run_polymarket_ws(polymarket_token_ids))
@@ -110,14 +110,15 @@ async def lifespan(app: FastAPI):
     # Graceful shutdown
     logger.info("Shutting down...")
 
-    ws_task.cancel()
+    # ws_task is None (Kalshi WS disabled) — skip cancel
+    if ws_task is not None:
+        ws_task.cancel()
+        try:
+            await ws_task
+        except asyncio.CancelledError:
+            pass
     if polymarket_ws_task is not None:
         polymarket_ws_task.cancel()
-    try:
-        await ws_task
-    except asyncio.CancelledError:
-        pass
-    if polymarket_ws_task is not None:
         try:
             await polymarket_ws_task
         except asyncio.CancelledError:

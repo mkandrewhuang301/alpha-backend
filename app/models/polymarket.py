@@ -211,6 +211,43 @@ class PolymarketTrade(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Tag Taxonomy (Gamma API /tags and /tags/{id}/related-tags/tags)
+# ---------------------------------------------------------------------------
+
+class PolymarketTagAPI(BaseModel):
+    """A single tag from the Polymarket Gamma /tags endpoint."""
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
+
+    id: Optional[Any] = None
+    label: Optional[str] = None
+    slug: Optional[str] = None
+    is_carousel: Optional[bool] = Field(default=False, alias="isCarousel")
+    force_show: Optional[bool] = Field(default=False, alias="forceShow")
+    force_hide: Optional[bool] = Field(default=False, alias="forceHide")
+
+    @property
+    def id_str(self) -> str:
+        return str(self.id) if self.id is not None else ""
+
+
+class PolymarketSportAPI(BaseModel):
+    """Sports metadata entry from the Polymarket Gamma /sports endpoint."""
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
+
+    sport: Optional[str] = None
+    series: Optional[str] = None                    # Active series slug
+    resolution_oracle_uri: Optional[str] = Field(default=None, alias="resolutionOracleURI")
+    tags: Optional[str] = None                      # Comma-separated tag ID string e.g. "100381, 100382"
+
+    @property
+    def tag_ids_list(self) -> List[str]:
+        """Split comma-separated tags string into a clean list of tag ID strings."""
+        if not self.tags:
+            return []
+        return [t.strip() for t in self.tags.split(",") if t.strip()]
+
+
+# ---------------------------------------------------------------------------
 # WebSocket / CLOB streaming (for future real-time price caching)
 # ---------------------------------------------------------------------------
 

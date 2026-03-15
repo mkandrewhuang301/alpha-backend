@@ -97,22 +97,31 @@ class PlatformTag(Base):
     The `slug` field is the critical link — it matches the slug strings stored in
     Series.categories, Series.tags, Event.categories, and Event.tags.
 
-    Kalshi:     type='category', ext_id=slug, parent_id=None (top-level category)
-    Polymarket: type='category', ext_id=category_id, parent_id=parent_slug for subcategories
-                type='tag',      ext_id=tag_id,      slug=tag_slug (from Gamma API)
+    Kalshi:     type='category', ext_id=slug,    parent_ids=[]                (top-level)
+                type='tag',      ext_id=slug,    parent_ids=["<cat-slug>"]    (tag under category)
+    Polymarket: type='category', ext_id=cat_id, parent_ids=[]                (top-level)
+                type='tag',      ext_id=tag_id, parent_ids=["<parent-tag-id>", ...] (multi-parent)
+
+    parent_ids is GIN-indexed for fast child lookups:
+        WHERE parent_ids @> ARRAY['<parent-slug-or-id>']
+
+    platform_metadata stores exchange-specific overflow fields:
+        Polymarket tags: {"polymarket_id": "12345", ...}
     """
     __tablename__ = "platform_tags"
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     exchange = Column(exchange_enum, nullable=False)
     type = Column(platform_tag_type_enum, nullable=False)
-    ext_id = Column(String, nullable=False)           # Polymarket id or Kalshi slug
-    parent_id = Column(String, nullable=True)          # Parent category slug (for subcategories)
-    slug = Column(String, nullable=False)              # Critical link to Event/Series ARRAY columns
-    label = Column(String, nullable=False)             # UI display text
+    ext_id = Column(String, nullable=False)              # Polymarket id or Kalshi slug
+    parent_ids = Column(ARRAY(String), default=list, nullable=True)  # Parent slugs/IDs (multi-parent support)
+    slug = Column(String, nullable=False)                # Critical link to Event/Series ARRAY columns
+    label = Column(String, nullable=False)               # UI display text
     image_url = Column(Text, nullable=True)
     is_carousel = Column(Boolean, default=False, nullable=False)
     force_show = Column(Boolean, default=False, nullable=False)
+    force_hide = Column(Boolean, default=False, nullable=False)
+    platform_metadata = Column(JSONB, default=dict, nullable=True)   # Exchange-specific overflow
     is_deleted = Column(Boolean, default=False, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=text("NOW()"))
     updated_at = Column(
@@ -125,6 +134,7 @@ class PlatformTag(Base):
         UniqueConstraint("exchange", "slug", "type", name="uq_platform_tags_exchange_slug_type"),
         Index("idx_platform_tags_slug", "slug"),
         Index("idx_platform_tags_exchange_type", "exchange", "type"),
+        Index("idx_platform_tags_parent_ids_gin", "parent_ids", postgresql_using="gin"),
     )
 
 
@@ -401,6 +411,41 @@ class MarketOutcome(Base):
     market = relationship("Market", back_populates="outcomes")
     public_trades = relationship("PublicTrade", back_populates="outcome")
     user_orders = relationship("UserOrder", back_populates="outcome")
+
+
+# ---------------------------------------------------------------------------
+# 3b. Sports Metadata (exchange-generic, GIN-indexed tag_ids array)
+# ---------------------------------------------------------------------------
+
+class SportsMetadata(Base):
+    """
+    Sports metadata across exchanges: sport identifiers, resolution oracles, linked tag IDs.
+
+    Polymarket: populated from GET /sports. The tags field is a comma-separated
+    string of tag IDs — stored as GIN-indexed ARRAY(text) for fast reverse lookups:
+        WHERE tag_ids @> ARRAY['<tag_id>']
+
+    Uses a composite PK (exchange, sport) so the same sport can exist per exchange.
+    """
+    __tablename__ = "sports_metadata"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    exchange = Column(exchange_enum, nullable=False)
+    sport = Column(Text, nullable=False)              # Sport identifier (e.g. "basketball")
+    series_slug = Column(Text, nullable=True)          # Active series slug
+    resolution_url = Column(Text, nullable=True)       # Resolution oracle URI
+    tag_ids = Column(ARRAY(Text), default=list, nullable=True)   # ARRAY of associated tag IDs
+    created_at = Column(DateTime(timezone=True), server_default=text("NOW()"))
+    updated_at = Column(
+        DateTime(timezone=True),
+        server_default=text("NOW()"),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+
+    __table_args__ = (
+        UniqueConstraint("exchange", "sport", name="uq_sports_metadata_exchange_sport"),
+        Index("idx_sports_metadata_tag_ids_gin", "tag_ids", postgresql_using="gin"),
+    )
 
 
 # ---------------------------------------------------------------------------

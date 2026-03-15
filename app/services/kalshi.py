@@ -20,7 +20,6 @@ from kalshi_python_async.models import (
     GetMarketsResponse,
     GetMarketResponse,
     GetEventMetadataResponse,
-    GetTagsForSeriesCategoriesResponse,
 )
 
 from app.core.config import KALSHI_API_KEY, KALSHI_PRIVATE_KEY, KALSHI_BASE_API_URL
@@ -339,11 +338,23 @@ async def get_tags_for_series_categories() -> dict[str, list[str]]:
     Returns a dict mapping category name → list of tag label strings.
     Used during ingest to populate PlatformTag rows with parent_id links.
     Returns {} on error (non-blocking — taxonomy is supplementary).
+
+    Bypasses SDK Pydantic model because the Kalshi API returns null for some
+    category values, which fails List[str] validation in GetTagsForSeriesCategoriesResponse.
     """
     try:
         search_api = _get_search_api()
-        resp: GetTagsForSeriesCategoriesResponse = await search_api.get_tags_for_series_categories()
-        return resp.tags_by_categories or {}
+        # Use the serialize helper to build auth-signed params, then call the API
+        # directly to get the raw response before Pydantic deserialization.
+        _param = search_api._get_tags_for_series_categories_serialize(
+            _request_auth=None, _content_type=None, _headers=None, _host_index=0
+        )
+        response_data = await search_api.api_client.call_api(*_param, _request_timeout=None)
+        await response_data.read()
+        raw = json.loads(response_data.data)
+        raw_dict = raw.get("tags_by_categories") or {}
+        # Filter out null/None values — Kalshi returns null for some categories
+        return {k: v for k, v in raw_dict.items() if isinstance(v, list)}
     except Exception as exc:
         logger.warning("[kalshi] Failed to fetch tags for series categories: %s", exc)
         return {}
