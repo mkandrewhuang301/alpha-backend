@@ -201,6 +201,14 @@ def _select_diverse_series(
         fmt = _infer_series_format_type(s)
         buckets[(primary_cat, fmt)].append(s)
 
+    # Sort within each bucket by 24h volume descending so round-robin always
+    # picks the highest-volume series per (category, format) slot first.
+    for bk in buckets:
+        buckets[bk].sort(
+            key=lambda s: float(s.get("volume24hr") or s.get("volume") or 0),
+            reverse=True,
+        )
+
     selected: list[dict] = []
     bucket_counters: dict[tuple[str, str], int] = defaultdict(int)
     # Sort buckets for deterministic ordering (category asc, then format asc)
@@ -1328,7 +1336,15 @@ async def run_polymarket_dev_sync() -> list[str]:
         logger.warning("[polymarket.ingest] Gamma API returned no active series — aborting DEV sync")
         return await load_polymarket_token_ids_from_db()
 
-    # 2. Select a diverse subset across (category, format_type) buckets
+    # 2. Sort candidate pool by 24h volume descending before diversity selection.
+    # This ensures that within each (category, format) bucket, the highest-volume
+    # series are at the front and get picked first during round-robin.
+    series_page.sort(
+        key=lambda s: float(s.get("volume24hr") or s.get("volume") or 0),
+        reverse=True,
+    )
+
+    # 3. Select a diverse subset across (category, format_type) buckets
     selected = _select_diverse_series(
         series_page,
         max_total=_DEV_SERIES_TARGET,
@@ -1341,12 +1357,13 @@ async def run_polymarket_dev_sync() -> list[str]:
     for s in selected:
         cats = _extract_category_labels(s)
         fmt = _infer_series_format_type(s)
+        vol = float(s.get("volume24hr") or s.get("volume") or 0)
         logger.info(
-            "[polymarket.ingest]   → slug=%-40s  category=%-20s  format=%s",
-            s.get("slug", ""), (cats[0] if cats else "?"), fmt,
+            "[polymarket.ingest]   → slug=%-40s  category=%-20s  format=%-12s  vol24h=$%.0f",
+            s.get("slug", ""), (cats[0] if cats else "?"), fmt, vol,
         )
 
-    # 3. Upsert each selected series + its events/markets/outcomes
+    # 4. Upsert each selected series + its events/markets/outcomes
     all_token_ids: list[str] = []
     all_event_ids: list[str] = []
 
@@ -1364,7 +1381,7 @@ async def run_polymarket_dev_sync() -> list[str]:
                 series_dict.get("id"), series_dict.get("slug"), exc, exc_info=True,
             )
 
-    # 4. Populate mutable dev config lists (dedup, preserve order)
+    # 5. Populate mutable dev config lists (dedup, preserve order)
     POLYMARKET_DEV_TOKEN_IDS.clear()
     POLYMARKET_DEV_TOKEN_IDS.extend(list(dict.fromkeys(all_token_ids)))
 
@@ -1377,7 +1394,7 @@ async def run_polymarket_dev_sync() -> list[str]:
         len(POLYMARKET_DEV_EVENT_IDS),
     )
 
-    # 5. If sync yielded nothing (all selected series have resolved markets),
+    # 6. If sync yielded nothing (all selected series have resolved markets),
     #    fall back to existing DB tokens so the WS still subscribes to something.
     if not POLYMARKET_DEV_TOKEN_IDS:
         logger.warning(
@@ -1390,7 +1407,7 @@ async def run_polymarket_dev_sync() -> list[str]:
             "[polymarket.ingest] DB fallback: %d token IDs loaded", len(db_tokens)
         )
 
-    # 6. Sync tag taxonomy + sports metadata (non-blocking)
+    # 7. Sync tag taxonomy + sports metadata (non-blocking)
     try:
         tag_stats = await run_polymarket_tag_sync(pool)
         logger.info(
