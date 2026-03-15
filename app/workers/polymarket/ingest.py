@@ -752,10 +752,11 @@ async def _fetch_all_tags(page_size: int = 100) -> list[dict]:
 async def _fetch_tag_children(tag_id: str) -> list[dict]:
     """
     Fetch child tags for a given parent tag ID from GET /tags/{id}/related-tags/tags.
-    Retries up to 3 times with exponential backoff on HTTP 429 (rate-limited).
+    Retries up to 6 times with exponential backoff on HTTP 429 (rate-limited).
+    Backoff sequence: 4s → 8s → 16s → 32s → 64s (capped at 60s).
     """
-    backoff = 2.0
-    max_retries = 3
+    backoff = 5.0
+    max_retries = 6
     for attempt in range(max_retries):
         try:
             async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as client:
@@ -767,7 +768,12 @@ async def _fetch_tag_children(tag_id: str) -> list[dict]:
                     return data if isinstance(data, list) else []
                 elif resp.status_code == 429:
                     if attempt < max_retries - 1:
-                        await asyncio.sleep(backoff)
+                        wait = min(backoff, 60.0)
+                        logger.warning(
+                            "[polymarket.ingest] 429 for tag_id=%s attempt=%d/%d — waiting %.0fs",
+                            tag_id, attempt + 1, max_retries, wait,
+                        )
+                        await asyncio.sleep(wait)
                         backoff *= 2.0
                     # else fall through to final return below
                 else:

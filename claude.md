@@ -252,7 +252,7 @@ alpha-backend/
 │   │   │   ├── ingest.py            # Gamma API sync: series/events/markets/outcomes/tags/sports
 │   │   │   │                        # run_polymarket_dev_sync() — startup sync (DEV_MODE)
 │   │   │   │                        # run_polymarket_state_reconciliation() — arq cron (DEV + prod, every 2min)
-│   │   │   │                        # _fetch_tag_children() — exponential backoff on 429 (2s→4s→8s, 3 attempts)
+│   │   │   │                        # _fetch_tag_children() — exponential backoff on 429 (5s→10s→20s→40s→60s→60s, 6 attempts, capped at 60s)
 │   │   │   │                        # _process_series() — caps at 4 events per series in DEV_MODE
 │   │   │   └── stream.py            # CLOB WS: book/price_change → Redis HSET, ZADD trending ZSET
 │   │   │                            # Resolution: last_trade_price >= 0.99|<= 0.01 → Gamma confirm → Postgres UPDATE
