@@ -10,7 +10,7 @@ GET /{exchange}/events/{event_id}   — full event detail with all markets/outco
 
 from datetime import datetime
 from decimal import Decimal
-from typing import Optional
+from typing import List, Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Path, Query
@@ -110,6 +110,27 @@ class EventDetailResponse(BaseModel):
     markets: list[MarketDetail] = []
 
 
+class TrendingEventItem(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    ext_id: str
+    title: str
+    category: Optional[str] = None
+    status: Optional[str] = None
+    close_time: Optional[datetime] = None
+    volume_24h: Optional[float] = None
+    image_url: Optional[str] = None
+    event_image_url: Optional[str] = None
+    featured_image_url: Optional[str] = None
+    competition: Optional[str] = None
+
+
+class TrendingEventsResponse(BaseModel):
+    events: list[TrendingEventItem]
+    count: int
+
+
 class CategoryListResponse(BaseModel):
     categories: list[str]
     count: int
@@ -118,6 +139,18 @@ class CategoryListResponse(BaseModel):
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
+
+@router.get("/{exchange}/events/trending", response_model=TrendingEventsResponse)
+async def get_trending_events(
+    exchange: str = Path(description="Exchange name: 'kalshi' or 'polymarket'"),
+    limit: int = Query(default=20, ge=1, le=100, description="Number of trending events"),
+    db: AsyncSession = Depends(get_db),
+) -> TrendingEventsResponse:
+    """Trending events ranked by rolling 24h volume from the exchange-specific Redis ZSET leaderboard."""
+    redis = await get_redis()
+    items = await event_service.get_trending_events(redis, db, exchange=exchange, limit=limit)
+    return TrendingEventsResponse(events=items, count=len(items))
+
 
 @router.get("/{exchange}/categories", response_model=CategoryListResponse)
 async def list_categories(
@@ -132,14 +165,15 @@ async def list_categories(
 @router.get("/{exchange}/events", response_model=EventFeedResponse)
 async def list_events(
     exchange: str = Path(description="Exchange name"),
-    category: Optional[str] = Query(default=None, description="Filter by category"),
-    series_ticker: Optional[str] = Query(default=None, description="Filter by series ticker (e.g. KXHIGHNY)"),
+    categories: Optional[List[str]] = Query(default=None, description="Filter by category slugs (OR logic — any match). Example: ?categories=politics&categories=economics"),
+    tags: Optional[List[str]] = Query(default=None, description="Filter by tag slugs (OR logic — any match). Example: ?tags=fed&tags=bitcoin"),
+    series_tickers: Optional[List[str]] = Query(default=None, description="Filter by series tickers (OR logic — any match). Example: ?series_tickers=KXFEDDECISION&series_tickers=KXIPO"),
     sort: str = Query(default="volume", description="Sort: 'volume', 'closing_soon', 'newest'"),
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
     db: AsyncSession = Depends(get_db),
 ) -> EventFeedResponse:
-    """Event feed with category/series filter, sorting, and pagination. Merges lead market yes/no prices from Redis."""
+    """Event feed with category/tag/series filter (OR logic), sorting, and pagination. Merges lead market yes/no prices from Redis."""
     redis = await get_redis()
     cache = MarketCacheManager(redis)
 
@@ -147,8 +181,9 @@ async def list_events(
         exchange=exchange,
         db=db,
         cache=cache,
-        category=category,
-        series_ticker=series_ticker,
+        categories=categories,
+        tags=tags,
+        series_tickers=series_tickers,
         sort=sort,
         limit=limit,
         offset=offset,
