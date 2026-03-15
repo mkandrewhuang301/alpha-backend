@@ -32,6 +32,11 @@ POLYMARKET_API_KEY = os.getenv("POLYMARKET_API_KEY", "")
 POLYMARKET_API_SECRET = os.getenv("POLYMARKET_API_SECRET", "")
 POLYMARKET_API_PASSPHRASE = os.getenv("POLYMARKET_API_PASSPHRASE", "")
 
+# Polymarket — relayer credentials (for Safe deployment + gasless transactions)
+POLYMARKET_RELAYER_URL = os.getenv("POLYMARKET_RELAYER_URL", "https://relayer-v2.polymarket.com")
+POLYMARKET_RELAYER_KEY = os.getenv("POLYMARKET_RELAYER_KEY", "")
+POLYMARKET_RELAYER_ADDRESS = os.getenv("POLYMARKET_RELAYER_ADDRESS", "")
+
 # Polymarket — builder credentials (for order attribution + fee sharing)
 POLYMARKET_BUILDER_KEY = os.getenv("POLYMARKET_BUILDER_KEY", "")
 POLYMARKET_BUILDER_ADDRESS = os.getenv("POLYMARKET_BUILDER_ADDRESS", "")
