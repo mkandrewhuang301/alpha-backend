@@ -12,16 +12,18 @@ import logging
 from kalshi_python_async import Configuration, KalshiClient
 from kalshi_python_async.api.market_api import MarketApi
 from kalshi_python_async.api.events_api import EventsApi
+from kalshi_python_async.api.search_api import SearchApi
 from kalshi_python_async.models import (
     GetSeriesResponse,
     GetEventsResponse,
     GetEventResponse,
     GetMarketsResponse,
     GetMarketResponse,
+    GetEventMetadataResponse,
 )
 
 from app.core.config import KALSHI_API_KEY, KALSHI_PRIVATE_KEY, KALSHI_BASE_API_URL
-from app.models.kalshi import KalshiSeriesListResponse
+from app.models.kalshi import KalshiEventMetadata, KalshiMarket, KalshiSeriesListResponse
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +50,9 @@ def _get_market_api() -> MarketApi:
 def _get_events_api() -> EventsApi:
     return EventsApi(_get_client())
 
+def _get_search_api() -> SearchApi:
+    return SearchApi(_get_client())
+
 # ---------------------------------------------------------------------------
 # Series
 # ---------------------------------------------------------------------------
@@ -55,8 +60,8 @@ def _get_events_api() -> EventsApi:
 async def get_series_list(
     category: str | None = None,
     tags: str | None = None,
-    include_product_metadata: bool = False,
-    include_volume: bool = False,
+    include_product_metadata: bool = True,
+    include_volume: bool = True,
     min_updated_ts: int | None = None,
 ) -> KalshiSeriesListResponse:
     """Fetch all Kalshi series.
@@ -64,6 +69,9 @@ async def get_series_list(
     Bypasses the SDK's own deserialization because the SDK's Series model
     rejects tags=null from the API. We use our KalshiSeries model instead,
     which handles Optional[List[str]] correctly.
+
+    Defaults include_product_metadata=True and include_volume=True to capture
+    image URLs and volume data for frontend display.
     """
     try:
         market_api = _get_market_api()
@@ -152,6 +160,27 @@ async def get_event(
 
 
 # ---------------------------------------------------------------------------
+# Event Metadata
+# ---------------------------------------------------------------------------
+
+async def get_event_metadata(event_ticker: str) -> KalshiEventMetadata | None:
+    """Fetch display metadata for an event (images, colors, settlement sources).
+
+    Returns None on error instead of raising — metadata is supplementary
+    and should not block the sync.
+    """
+    try:
+        events_api = _get_events_api()
+        resp: GetEventMetadataResponse = await events_api.get_event_metadata(
+            event_ticker=event_ticker,
+        )
+        return KalshiEventMetadata(**resp.to_dict())
+    except Exception as exc:
+        logger.warning("[kalshi] Failed to fetch event metadata for %s: %s", event_ticker, exc)
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Markets
 # ---------------------------------------------------------------------------
 
@@ -179,6 +208,56 @@ async def get_markets(
         return resp
     except Exception as exc:
         logger.error("[kalshi] Failed to fetch markets: %s", exc)
+        raise
+
+
+async def get_markets_raw(
+    status: str | None = None,
+    series_ticker: str | None = None,
+    event_ticker: str | None = None,
+    limit: int | None = None,
+    cursor: str | None = None,
+    min_updated_ts: int | None = None,
+) -> tuple[list[KalshiMarket], str | None]:
+    """Fetch paginated markets using raw JSON, bypassing SDK model validation.
+
+    The SDK's Market model has required (non-Optional) price/volume fields
+    that the Kalshi API returns as null for closed/settled markets, causing
+    ValidationError. This function uses the same auth/transport but parses
+    with our own KalshiMarket model which has all Optional fields.
+
+    Returns (markets, next_cursor).
+    """
+    try:
+        market_api = _get_market_api()
+        _param = market_api._get_markets_serialize(
+            limit=limit,
+            cursor=cursor,
+            event_ticker=event_ticker,
+            series_ticker=series_ticker,
+            min_created_ts=None,
+            max_created_ts=None,
+            min_updated_ts=min_updated_ts,
+            max_close_ts=None,
+            min_close_ts=None,
+            min_settled_ts=None,
+            max_settled_ts=None,
+            status=status,
+            tickers=None,
+            mve_filter=None,
+            _request_auth=None,
+            _content_type=None,
+            _headers=None,
+            _host_index=0,
+        )
+        response_data = await market_api.api_client.call_api(*_param)
+        await response_data.read()
+        raw = json.loads(response_data.data)
+        markets = [KalshiMarket(**m) for m in (raw.get("markets") or [])]
+        next_cursor = raw.get("cursor")
+        return markets, next_cursor
+    except Exception as exc:
+        logger.error("[kalshi] Failed to fetch markets (raw): %s", exc)
         raise
 
 
@@ -247,3 +326,35 @@ async def batch_get_market_candlesticks(
     except Exception as exc:
         logger.error("[kalshi] Failed to batch fetch candlesticks for %s markets: %s", len(market_tickers), exc)
         raise
+
+
+# ---------------------------------------------------------------------------
+# Search / Taxonomy
+# ---------------------------------------------------------------------------
+
+async def get_tags_for_series_categories() -> dict[str, list[str]]:
+    """Fetch tags grouped by Kalshi series category from the SearchAPI.
+
+    Returns a dict mapping category name → list of tag label strings.
+    Used during ingest to populate PlatformTag rows with parent_id links.
+    Returns {} on error (non-blocking — taxonomy is supplementary).
+
+    Bypasses SDK Pydantic model because the Kalshi API returns null for some
+    category values, which fails List[str] validation in GetTagsForSeriesCategoriesResponse.
+    """
+    try:
+        search_api = _get_search_api()
+        # Use the serialize helper to build auth-signed params, then call the API
+        # directly to get the raw response before Pydantic deserialization.
+        _param = search_api._get_tags_for_series_categories_serialize(
+            _request_auth=None, _content_type=None, _headers=None, _host_index=0
+        )
+        response_data = await search_api.api_client.call_api(*_param, _request_timeout=None)
+        await response_data.read()
+        raw = json.loads(response_data.data)
+        raw_dict = raw.get("tags_by_categories") or {}
+        # Filter out null/None values — Kalshi returns null for some categories
+        return {k: v for k, v in raw_dict.items() if isinstance(v, list)}
+    except Exception as exc:
+        logger.warning("[kalshi] Failed to fetch tags for series categories: %s", exc)
+        return {}

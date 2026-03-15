@@ -14,11 +14,11 @@ PRODUCTION MODE (DEV_MODE=False):
     3. market_lifecycle_v2 messages: dispatched as individual asyncio.Tasks (low-frequency)
 
 DEVELOPMENT MODE (DEV_MODE=True):
-    Scope reduction + memory debouncing for free-tier Redis Cloud (100 ops/sec limit):
-    1. Subscribe only to DEV_TARGET_MARKETS (3 series → ~30 open markets)
-    2. WebSocket receive loop: overwrite in-memory dict (latest_ticks[market_id] = data)
-    3. Background flusher: wakes every 1.5s, flushes latest_ticks dict via single pipeline
-    This guarantees ≤ ~60 Redis ops/sec regardless of how fast Kalshi sends updates.
+    Scope reduction with production-grade micro-batching (Railway Pro — no ops/sec limit):
+    1. Subscribe only to DEV_TARGET_MARKETS (explicit 11 series → scoped markets)
+    2. WebSocket receive loop: enqueue ticker updates into asyncio.Queue (same as prod)
+    3. Background flusher: drains queue in 100ms or 500-item batches (same as prod)
+    The filtered WS subscription limits scope; micro-batching handles throughput.
 
 Runs as a long-lived asyncio task started in FastAPI lifespan.
 Reconnects with exponential backoff on disconnect.
@@ -29,6 +29,7 @@ import base64
 import json
 import logging
 import time
+from decimal import Decimal
 from datetime import datetime, timezone
 from typing import NamedTuple
 
@@ -54,8 +55,6 @@ FLUSH_INTERVAL = 0.1   # 100ms
 BATCH_SIZE = 500        # max items per flush
 QUEUE_MAX_SIZE = 100_000
 
-# Dev debounce parameters
-DEV_FLUSH_INTERVAL = 1.5  # seconds between Redis writes in dev mode
 
 
 # ---------------------------------------------------------------------------
@@ -64,12 +63,14 @@ DEV_FLUSH_INTERVAL = 1.5  # seconds between Redis writes in dev mode
 
 class TickerUpdate(NamedTuple):
     market_ticker: str
+    event_ticker: str  # parent event for ZSET trending aggregation
     yes_key: str
     no_key: str
     yes_data: dict
     no_data: dict
     last_price_cents: int
     volume: int
+    volume_24h_fp: Decimal  # fixed-point 24h volume from Kalshi _fp field
 
 
 # ---------------------------------------------------------------------------
@@ -84,15 +85,6 @@ def _get_ticker_queue() -> asyncio.Queue:
     if _ticker_queue is None:
         _ticker_queue = asyncio.Queue(maxsize=QUEUE_MAX_SIZE)
     return _ticker_queue
-
-
-# ---------------------------------------------------------------------------
-# In-memory dict for DEV_MODE debouncing
-# ---------------------------------------------------------------------------
-
-# Latest tick per market — the flusher drains this every 1.5s.
-# Only the last update per market is kept (deduplication).
-_latest_ticks: dict[str, TickerUpdate] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -140,16 +132,26 @@ def _parse_ticker(msg: dict) -> TickerUpdate | None:
 
     Returns None if the message has no market_ticker.
     Intentionally synchronous and non-blocking.
+
+    Extracts both legacy integer fields and new fixed-point _fp string variants
+    (volume_24h_fp, volume_fp) introduced in Kalshi's March 2026 migration.
     """
     data = msg.get("msg", {})
     ticker = data.get("market_ticker")
     if not ticker:
         return None
 
+    event_ticker = data.get("event_ticker", "")
+
     ts = str(int(time.time()))
     last_price = data.get("last_price", 0) or 0
     volume_raw = data.get("volume", 0) or 0
-    volume_str = str(volume_raw)
+
+    # Prefer fixed-point _fp strings when available, fall back to legacy ints
+    volume_24h_fp_str = data.get("volume_24h_fp") or data.get("volume_fp")
+    volume_24h_fp = Decimal(volume_24h_fp_str) if volume_24h_fp_str else Decimal(volume_raw)
+
+    volume_str = str(volume_24h_fp)
 
     yes_data = {
         "price": _normalize_cents(last_price),
@@ -173,12 +175,14 @@ def _parse_ticker(msg: dict) -> TickerUpdate | None:
 
     return TickerUpdate(
         market_ticker=ticker,
+        event_ticker=event_ticker,
         yes_key=_make_key("kalshi", f"{ticker}-yes"),
         no_key=_make_key("kalshi", f"{ticker}-no"),
         yes_data=yes_data,
         no_data=no_data,
         last_price_cents=int(last_price),
         volume=int(volume_raw),
+        volume_24h_fp=volume_24h_fp,
     )
 
 
@@ -258,6 +262,19 @@ async def _redis_flusher(redis_conn) -> None:
                 seen[update.market_ticker] = update  # last write per market wins
             asyncio.create_task(_flush_candles(redis_conn, list(seen.values())))
 
+            # Phase 3: ZADD trending events leaderboard (aggregate volume per event)
+            event_volumes: dict[str, float] = {}
+            for update in batch:
+                if update.event_ticker:
+                    event_volumes[update.event_ticker] = event_volumes.get(
+                        update.event_ticker, 0
+                    ) + float(update.volume_24h_fp)
+            if event_volumes:
+                pipe2 = redis_conn.pipeline(transaction=False)
+                for evt, vol in event_volumes.items():
+                    pipe2.zadd("events_trending_24h_kalshi", {evt: vol})
+                await pipe2.execute()
+
             logger.debug(
                 "[kalshi.stream] Flushed %d ticker updates (%d unique markets)",
                 len(batch),
@@ -270,69 +287,6 @@ async def _redis_flusher(redis_conn) -> None:
         except Exception as exc:
             logger.error("[kalshi.stream] Flusher error: %s", exc)
             await asyncio.sleep(0.1)
-
-
-# ---------------------------------------------------------------------------
-# DEVELOPMENT MODE: In-memory debounce + 1.5s periodic flusher
-# ---------------------------------------------------------------------------
-
-def _dev_enqueue_ticker(msg: dict) -> None:
-    """
-    DEV_MODE ticker handler: overwrite latest_ticks dict (non-blocking).
-
-    Even if the same market fires 50 updates per second, only the most
-    recent snapshot is kept. The background flusher writes it once per 1.5s.
-    """
-    update = _parse_ticker(msg)
-    if update is None:
-        return
-    _latest_ticks[update.market_ticker] = update
-
-
-async def _dev_redis_flusher(redis_conn) -> None:
-    """
-    DEV_MODE background task: flush latest_ticks to Redis every 1.5 seconds.
-
-    Operations per flush cycle (worst case, 30 markets):
-        - 30 markets × 2 HSET (yes + no) = 60 ops
-        - 30 markets × 1 EVAL (candle Lua) = 30 ops  (pipelined)
-        Total: ~90 ops per 1.5s ≈ 60 ops/sec — safely under 100 ops/sec limit.
-
-    The pipeline batches ALL commands into a single network round-trip,
-    so Redis Cloud counts each command individually but they all arrive together.
-    """
-    while True:
-        try:
-            await asyncio.sleep(DEV_FLUSH_INTERVAL)
-
-            if not _latest_ticks:
-                continue
-
-            # Snapshot and clear atomically (asyncio is single-threaded)
-            snapshot = dict(_latest_ticks)
-            _latest_ticks.clear()
-
-            updates = list(snapshot.values())
-
-            # Batch HSET for all yes/no ticker data
-            pipe = redis_conn.pipeline(transaction=False)
-            for update in updates:
-                pipe.hset(update.yes_key, mapping=update.yes_data)
-                pipe.hset(update.no_key, mapping=update.no_data)
-            await pipe.execute()
-
-            # Batch candle EVAL via pipeline (one pipeline round-trip)
-            candle_updates = [(u.market_ticker, u.last_price_cents, u.volume) for u in updates]
-            await batch_update_live_candles(redis_conn, candle_updates)
-
-            logger.debug("[kalshi.stream] DEV flush: %d unique markets → Redis", len(updates))
-
-        except asyncio.CancelledError:
-            logger.info("[kalshi.stream] DEV flusher task cancelled.")
-            return
-        except Exception as exc:
-            logger.error("[kalshi.stream] DEV flusher error: %s", exc)
-            await asyncio.sleep(0.5)
 
 
 # ---------------------------------------------------------------------------
@@ -416,10 +370,11 @@ async def run_kalshi_ws() -> None:
 
     redis_conn = await get_redis()
 
-    # Choose flusher based on mode
+    # Both modes use the production micro-batching flusher.
+    # DEV_MODE only differs in WS subscription scope (filtered to DEV_TARGET_MARKETS).
     if DEV_MODE:
-        flusher_coro = _dev_redis_flusher(redis_conn)
-        logger.info("[kalshi.stream] DEV_MODE: using memory-debounced flusher (1.5s interval)")
+        flusher_coro = _redis_flusher(redis_conn)
+        logger.info("[kalshi.stream] DEV_MODE: using production micro-batching flusher (filtered subscription)")
     else:
         flusher_coro = _redis_flusher(redis_conn)
         logger.info("[kalshi.stream] PROD MODE: using micro-batching flusher (100ms interval)")
@@ -481,10 +436,7 @@ async def run_kalshi_ws() -> None:
                         msg_type = msg.get("type")
 
                         if msg_type == "ticker":
-                            if DEV_MODE:
-                                _dev_enqueue_ticker(msg)
-                            else:
-                                _enqueue_ticker(msg)
+                            _enqueue_ticker(msg)
                         elif msg_type == "market_lifecycle_v2":
                             asyncio.create_task(_handle_market_lifecycle(msg))
                         else:

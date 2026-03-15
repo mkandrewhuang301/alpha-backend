@@ -1,8 +1,8 @@
 """
 Series endpoints — data served from PostgreSQL (populated by workers.kalshi.ingest).
 
-GET /series            - list all series, filterable by exchange and category
-GET /series/{ticker}   - single series by Kalshi ticker (ext_id)
+GET /series            - list all series, filterable by exchange, categories, tags
+GET /series/{ticker}   - single series by exchange ticker (ext_id)
 """
 
 from typing import List, Optional
@@ -28,11 +28,11 @@ class SeriesResponse(BaseModel):
 
     id: UUID
     exchange: str
-    ticker: str                     # ext_id — native exchange identifier (Kalshi ticker, Polymarket slug)
+    ticker: str                         # ext_id — native exchange identifier
     title: str
     description: Optional[str] = None
-    category: Optional[str] = None
-    tags: Optional[List[str]] = None
+    categories: Optional[List[str]] = None  # ARRAY(text) slug strings
+    tags: Optional[List[str]] = None        # ARRAY(text) slug strings
     image_url: Optional[str] = None
     frequency: Optional[str] = None
 
@@ -53,8 +53,8 @@ def _row_to_response(row: Series) -> SeriesResponse:
         ticker=row.ext_id,
         title=row.title,
         description=row.description,
-        category=row.category,
-        tags=row.tags or [],
+        categories=list(row.categories) if row.categories else [],
+        tags=list(row.tags) if row.tags else [],
         image_url=row.image_url,
         frequency=row.frequency,
     )
@@ -67,16 +67,36 @@ def _row_to_response(row: Series) -> SeriesResponse:
 @router.get("/", response_model=SeriesListResponse)
 async def list_series(
     exchange: Optional[str] = Query(default="kalshi", description="Exchange filter: 'kalshi' | 'polymarket'"),
-    category: Optional[str] = Query(default=None, description="Category filter, e.g. 'Politics', 'Sports'"),
+    categories: Optional[List[str]] = Query(
+        default=None,
+        description="Filter by one or more category slugs (AND logic — series must match all). "
+                    "Example: ?categories=economics&categories=finance",
+    ),
+    tags: Optional[List[str]] = Query(
+        default=None,
+        description="Filter by one or more tag slugs (AND logic). "
+                    "Example: ?tags=fed&tags=interest-rates",
+    ),
     db: AsyncSession = Depends(get_db),
 ) -> SeriesListResponse:
-    """List all series stored in the database, defaulting to Kalshi."""
+    """
+    List all series. Supports filtering by exchange, categories, and tags.
+
+    `categories` and `tags` accept multiple values and use PostgreSQL GIN @> (contains all)
+    operator — only series matching every specified slug are returned.
+    """
     stmt = select(Series).where(Series.is_deleted == False)
 
     if exchange:
         stmt = stmt.where(Series.exchange == exchange)
-    if category:
-        stmt = stmt.where(Series.category == category)
+
+    if categories:
+        # @> contains-all: series.categories @> ARRAY['economics', 'finance']
+        stmt = stmt.where(Series.categories.contains(categories))
+
+    if tags:
+        # @> contains-all: series.tags @> ARRAY['fed', 'interest-rates']
+        stmt = stmt.where(Series.tags.contains(tags))
 
     stmt = stmt.order_by(Series.title)
 

@@ -116,34 +116,59 @@ FastAPI Backend (web process)
 
 **Data flow for market data:**
 ```
-Kalshi WS ──► ticker channel ──► Redis HSET ticker:{exchange}:{asset_id} + candle:{ticker}:{min} (live OHLCV)
-Kalshi WS ──► market_lifecycle_v2 ──► PostgreSQL UPDATE only (status/result; semaphore(3) for connection safety)
+Polymarket CLOB WS ──► book/price_change ──► Redis HSET ticker:polymarket:{token_id}
+                                           + ZADD events_trending_24h_polymarket
+Polymarket CLOB WS ──► last_trade_price >= 0.99|<= 0.01 ──► _resolution_candidates set
+                   ──► Phase 3 flusher ──► _check_and_update_market_resolution()
+                   ──► Gamma API confirm ──► PostgreSQL UPDATE (status=resolved, result=outcome)
+Kalshi WS ──► DISABLED (ws_task = None in main.py) ──► no streaming in current build
+arq cron  ──► polymarket_state_reconciliation (every 2min, DEV + prod) ──► Gamma API batch → PostgreSQL UPDATE
 arq cron  ──► kalshi_full_sync (15m, prod only) ──► PostgreSQL (full series+events+markets+outcomes backfill)
-arq cron  ──► state_reconciliation (1m, prod only) ──► PostgreSQL (delta via min_updated_ts filter)
+arq cron  ──► kalshi_state_reconciliation (1m, prod only) ──► PostgreSQL (delta via min_updated_ts filter)
 arq cron  ──► aggregate_event_volumes (5m, prod only) ──► PostgreSQL (events.volume_24h from market metadata)
 arq cron  ──► aggregate_ohlcv (1m, prod only) ──► PostgreSQL market_ticks (tick snapshots from Redis)
-POST /api/v1/dev/sync-kalshi ──► run_kalshi_dev_sync() ──► PostgreSQL (dev mode manual trigger)
+POST /api/v1/dev/sync/{exchange} ──► run_{exchange}_dev_sync() ──► PostgreSQL (dev mode manual trigger)
 Kalshi REST ──► historical candlesticks (on-demand per API request)
 PostgreSQL + Redis ──► FastAPI routes ──► iOS app
 ```
 
-**DEV_MODE vs Production WebSocket strategy:**
-```
-DEV_MODE=False (production):
-  Subscribe: global firehose (no market_tickers filter)
-  WS receive loop → _enqueue_ticker() → asyncio.Queue(maxsize=100_000) (non-blocking, drops if full)
-  _redis_flusher() → drain in 100ms/500-item batches → pipeline HSET
-  Phase 2: asyncio.create_task(_flush_candles()) → batch candle EVAL (fire-and-forget, dedup per market)
+**Kalshi WebSocket status:** Currently **disabled** (`ws_task = None` in `main.py`, import commented out). Kalshi price data is updated only via arq crons. This is intentional — Polymarket is the primary real-time exchange in the current build.
 
-DEV_MODE=True (sandbox — free-tier Redis Cloud ≤100 ops/sec):
-  Subscribe: {"channels": [...], "market_tickers": [...DEV_TARGET_MARKETS]}
-  WS receive loop → _dev_enqueue_ticker() → _latest_ticks[market_id] = update (dict overwrite)
-  _dev_redis_flusher() → await asyncio.sleep(1.5) → snapshot+clear _latest_ticks → pipeline HSET+EVAL
-  Max ~60–90 ops/sec (N markets × 2 HSET + N EVAL per 1.5s — always under 100 ops/sec limit)
+**Polymarket WebSocket strategy (`workers/polymarket/stream.py`):**
+```
+Both DEV_MODE and production use the same micro-batching flusher:
+  WS receive loop → _enqueue_ticker(msg) → asyncio.Queue(maxsize=100_000) (non-blocking, drops if full)
+  _redis_flusher() → drain in 100ms/500-item batches → pipeline HSET ticker:polymarket:{token_id}
+                   → Phase 2: ZADD events_trending_24h_polymarket (volume from tick data)
+                   → Phase 3: drain _resolution_candidates → asyncio.create_task(_check_and_update_market_resolution())
+
+Resolution candidate detection:
+  last_trade_price >= 0.99 or <= 0.01 → add token_id to _resolution_candidates set
+  _check_and_update_market_resolution(token_id):
+    → Semaphore(3) — caps concurrent Supabase connections
+    → GET Gamma API /markets?conditionId={id}
+    → if tokens[].winner == true → UPDATE markets SET status='resolved', result={outcome}
+
+Subscribe message:
+  {"type": "market", "assets_ids": [token_id, ...]}  (all synced token IDs)
+```
+
+**Kalshi WebSocket strategy (`workers/kalshi/stream.py`) — for when it's re-enabled:**
+```
+DEV_MODE=True:
+  Subscribe: {"channels": [...], "market_tickers": [...DEV_TARGET_MARKETS]} (filtered to explicit series)
+  WS receive loop → _enqueue_ticker() → asyncio.Queue(maxsize=100_000)
+  _redis_flusher() → drain in 100ms/500-item batches → pipeline HSET
+
+DEV_MODE=False (production):
+  Subscribe: global firehose (no market_tickers filter — all 5000+ markets)
+  WS receive loop → _enqueue_ticker() → asyncio.Queue(maxsize=100_000)
+  _redis_flusher() → drain in 100ms/500-item batches → pipeline HSET
+  Phase 2: asyncio.create_task(_flush_candles()) → batch candle EVAL (fire-and-forget)
 
 Lifecycle events (both modes):
   market_lifecycle_v2 → asyncio.create_task(_handle_market_lifecycle(msg))
-  _lifecycle_semaphore = asyncio.Semaphore(3) — caps concurrent Supabase connections (free-tier limit)
+  _lifecycle_semaphore = asyncio.Semaphore(3) — caps concurrent Supabase connections
   Only UPDATEs (status, result) — never INSERTs (lifecycle msgs lack event_id, which is NOT NULL)
 ```
 
@@ -169,7 +194,8 @@ The database is the single source of truth for all market data served to the fro
 - **Cache / Queue**: Redis (via `redis[hiredis]`) — tick data HSET cache + arq job queue
 - **Background Jobs**: arq (Redis-backed async worker, runs as separate process)
 - **Kalshi SDK**: `kalshi-python-async` — handles RSA auth, pagination internally
-- **Real-time**: WebSocket firehose (`websockets` library) to Kalshi for ticker + lifecycle events
+- **Real-time**: Polymarket CLOB WebSocket (`websockets` library) for live price + resolution detection; Kalshi WebSocket currently disabled
+- **Polymarket REST**: `httpx` async client — Gamma API (public, no auth) for series/events/markets/tags/sports
 - **Push Notifications**: Firebase Cloud Messaging + APNs
 - **AI**: OpenAI API (GPT-4o)
 - **Sports Data**: Rotowire (MVP) → Sportradar (post traction)
@@ -184,6 +210,7 @@ The database is the single source of truth for all market data served to the fro
 alpha-backend/
 ├── app/
 │   ├── main.py                      # FastAPI entry point; lifespan manages WS + pools
+│   │                                # NOTE: Kalshi WS disabled (ws_task = None). Polymarket WS active.
 │   ├── api/
 │   │   └── routes/
 │   │       ├── markets.py           # Market endpoints — queries DB
@@ -192,7 +219,8 @@ alpha-backend/
 │   │       ├── v1/                  # Versioned endpoints (DB + Redis live data)
 │   │       │   ├── events.py        # /api/v1/{exchange}/events — live prices merged
 │   │       │   ├── candlesticks.py  # /api/v1/kalshi/events/{ticker}/candlesticks — hybrid OHLCV
-│   │       │   └── dev.py           # /api/v1/dev/sync-kalshi — manual sync (DEV_MODE only, returns 403 in prod)
+│   │       │   └── dev.py           # /api/v1/dev/sync/{exchange} — manual sync (DEV_MODE only, returns 403 in prod)
+│   │       ├── categories.py        # /categories/platform-tags — PlatformTag taxonomy (exchange, type, parent_ids, slug)
 │   │       ├── sports.py            # Injuries, lineups, stats, weather, refs (planned)
 │   │       ├── traders.py           # Sharp trader leaderboard, profiles (planned)
 │   │       ├── users.py             # Auth, positions, portfolio (planned)
@@ -200,8 +228,13 @@ alpha-backend/
 │   │       └── notifications.py     # Notification history and preferences (planned)
 │   ├── models/
 │   │   ├── db.py                    # SQLAlchemy ORM models (one per DB table)
+│   │   │                            # Key models: Series, Event, Market, MarketOutcome,
+│   │   │                            #   PlatformTag (unified, parent_ids ARRAY, GIN indexed),
+│   │   │                            #   SportsMetadata (exchange + sport PK, tag_ids ARRAY, GIN indexed)
 │   │   ├── kalshi.py                # Pydantic models for Kalshi API responses
-│   │   └── polymarket.py            # Pydantic models for Polymarket API responses
+│   │   └── polymarket.py            # Pydantic models for Polymarket Gamma API responses
+│   │                                # Key models: PolymarketSeries, PolymarketEvent, PolymarketMarket,
+│   │                                #   PolymarketToken, PolymarketCategory
 │   ├── services/
 │   │   ├── kalshi.py                # Kalshi SDK wrapper (REST API + candlesticks)
 │   │   ├── events.py                # Event query logic + Redis price enrichment
@@ -213,24 +246,46 @@ alpha-backend/
 │   │   └── weather.py               # Weather API wrapper (planned)
 │   ├── workers/
 │   │   ├── kalshi/
-│   │   │   ├── ingest.py            # Syncs series/events/markets/outcomes + OHLCV aggregation
-│   │   │   └── stream.py            # WebSocket firehose: ticker → Redis + live candles, lifecycle → Postgres
-│   │   ├── injury_monitor.py        # Polls injury reports every 5 min
-│   │   ├── lineup_monitor.py        # Watches lineup releases
-│   │   ├── market_monitor.py        # Watches line movement and volume spikes
-│   │   └── whale_monitor.py         # Polymarket large position detection
+│   │   │   ├── ingest.py            # Full sync + delta sync + OHLCV aggregation (prod arq crons)
+│   │   │   └── stream.py            # WebSocket firehose (DISABLED — ws_task=None in main.py)
+│   │   ├── polymarket/
+│   │   │   ├── ingest.py            # Gamma API sync: series/events/markets/outcomes/tags/sports
+│   │   │   │                        # run_polymarket_dev_sync() — startup sync (DEV_MODE)
+│   │   │   │                        # run_polymarket_state_reconciliation() — arq cron (DEV + prod, every 2min)
+│   │   │   │                        # _fetch_tag_children() — exponential backoff on 429 (2s→4s→8s, 3 attempts)
+│   │   │   │                        # _process_series() — caps at 4 events per series in DEV_MODE
+│   │   │   └── stream.py            # CLOB WS: book/price_change → Redis HSET, ZADD trending ZSET
+│   │   │                            # Resolution: last_trade_price >= 0.99|<= 0.01 → Gamma confirm → Postgres UPDATE
+│   │   ├── taxonomy.py              # upsert_platform_tag(parent_ids, force_hide, platform_metadata), slugify()
+│   │   ├── injury_monitor.py        # Polls injury reports every 5 min (planned)
+│   │   ├── lineup_monitor.py        # Watches lineup releases (planned)
+│   │   ├── market_monitor.py        # Watches line movement and volume spikes (planned)
+│   │   └── whale_monitor.py         # Polymarket large position detection (planned)
 │   └── core/
 │       ├── config.py                # Loads all env variables (including DEV_MODE)
-│       ├── dev_config.py            # DEV_MODE sandbox constants: DEV_TARGET_SERIES, DEV_TARGET_MARKETS
+│       ├── dev_config.py            # DEV_MODE sandbox constants:
+│       │                            #   POLYMARKET_DEV_SERIES_SLUGS (5 curated slugs)
+│       │                            #   DEV_EXPLICIT_SERIES (Kalshi series dict, currently all commented out)
+│       │                            #   DEV_TARGET_SERIES, DEV_TARGET_MARKETS (populated at startup)
+│       │                            #   POLYMARKET_DEV_TOKEN_IDS, POLYMARKET_DEV_EVENT_IDS
 │       ├── database.py              # SQLAlchemy engine + raw asyncpg pool
 │       ├── redis.py                 # Redis async connection (arq queue + tick cache)
-│       └── arq_worker.py            # arq WorkerSettings + cron job registration (crons disabled in DEV_MODE)
+│       └── arq_worker.py            # arq WorkerSettings + cron job registration
+│                                    # DEV_MODE: only polymarket_state_reconciliation (every 2min)
+│                                    # PROD: full suite (kalshi_full_sync, kalshi_state_reconciliation,
+│                                    #   aggregate_ohlcv, aggregate_event_volumes, polymarket_state_reconciliation)
+├── migrations/
+│   └── versions/
+│       └── 0001_complete_schema.py  # Single idempotent migration — safe on fresh or existing DB
+│                                    # Idempotency guards: _table_exists(), _col_exists(), _index_exists()
+│                                    # Handles: platform_tags (parent_ids ARRAY, force_hide, platform_metadata),
+│                                    #   sports_metadata table, drops old polymarket_tags/polymarket_sports_metadata
 ├── tests/
 ├── .env                             # Real keys — NEVER commit
 ├── .env.example                     # Template — commit this
 ├── .gitignore
 ├── requirements.txt
-├── Procfile
+├── Procfile                         # web: uvicorn + worker: arq (both needed in DEV_MODE and prod)
 └── README.md
 ```
 
@@ -242,17 +297,28 @@ Three-level market hierarchy normalised across exchanges:
 
 ```
 series (exchange, ext_id)
-  └── events (exchange, ext_id, series_id)
+  └── events (exchange, ext_id, series_ids ARRAY[UUID])
         └── markets (exchange, ext_id, event_id)
               └── market_outcomes (market_id, execution_asset_id)
 ```
 
 Key design decisions:
-- `ext_id` is the native exchange identifier (Kalshi ticker, Polymarket slug/conditionId)
+- `ext_id` is the native exchange identifier (Kalshi ticker, Polymarket conditionId/event id/series id)
 - `exchange` enum (`kalshi` | `polymarket`) on every row enables cross-exchange queries
-- `platform_metadata JSONB` absorbs exchange-specific fields (Kalshi CTF IDs, Neg Risk flags, etc.) without schema changes
+- `platform_metadata JSONB` absorbs exchange-specific fields without schema changes
 - All tables use soft deletes (`is_deleted`) — never hard-delete market data
-- `market_outcomes.execution_asset_id` = Kalshi `"yes"/"no"` or Polymarket ERC-1155 token ID
+- `market_outcomes.execution_asset_id` = Kalshi `"yes"/"no"` or Polymarket ERC-1155 clobTokenId
+- **Array taxonomy**: `series.categories`, `series.tags`, `events.categories`, `events.tags` are all `ARRAY(text)` slug strings with GIN indexes — O(1) `@>` containment filtering
+- **series_ids**: `events.series_ids` is `ARRAY(UUID)` — supports Polymarket many-to-many events↔series. Filter via `array_position(series_ids, $uuid)` in SQLAlchemy.
+- **PlatformTag** (`platform_tags` table): unified tag taxonomy across exchanges. Fields: `exchange`, `type` (`category`|`tag`), `slug`, `label`, `image_url`, `is_carousel`, `force_show`, `force_hide`, `platform_metadata JSONB`, **`parent_ids ARRAY(text)`** (GIN indexed). Slug matches ARRAY values in events/series. `parent_ids` enables multi-parent tag hierarchies (e.g. a tag belonging to multiple sport categories).
+- **SportsMetadata** (`sports_metadata` table): `exchange` + `sport` as composite PK, `tag_ids ARRAY(text)` (GIN indexed), `resolution_url`, `series_slug`. Replaces old exchange-specific `polymarket_sports_metadata` table.
+- **Taxonomy slugify rule**: `slugify(str)` normalizes any string to URL-safe slug (lowercase, hyphens, no special chars). All ARRAY taxonomy values use slugified strings.
+- **Alembic**: Single idempotent migration `0001_complete_schema.py` — run `alembic upgrade head` to apply on any DB state.
+
+Frontend display columns (added to avoid JSONB parsing on the FE):
+- `series.settlement_sources` (JSONB), `series.contract_url`, `series.additional_prohibitions` (JSONB)
+- `events.sub_title`, `events.featured_image_url`, `events.settlement_sources` (JSONB), `events.competition`, `events.competition_scope`
+- `markets.yes_sub_title`, `markets.no_sub_title`, `markets.image_url`, `markets.color_code`, `markets.open_interest`, `markets.volume`
 
 Full SQL schema is in `/schema.sql`. ORM models live in `app/models/db.py`.
 
@@ -283,9 +349,12 @@ Full SQL schema is in `/schema.sql`. ORM models live in `app/models/db.py`.
 - All Optional fields should default to `None`, not raise `ValidationError`
 
 ### `polymarket.py` — Pydantic API Models
-- Typed representations of Polymarket REST/on-chain responses
+- Typed representations of Polymarket Gamma API responses
 - Prices from Polymarket are already normalized to 0.0–1.0 float
-- Wallet hashes are stored as-is in `tracked_entities.external_identifier`
+- Key models: `PolymarketCategory` (id + label, `label_str` property), `PolymarketSeries` (`category_labels` property), `PolymarketEvent`, `PolymarketMarket` (conditionId as ext_id), `PolymarketToken`
+- `_parse_json_field()` handles Gamma API returning `outcomes` and `clobTokenIds` as either JSON strings or native lists
+- Zipping: `zip(outcomes, token_ids)` → one `MarketOutcome` row per `(outcome_label, token_id)` pair
+- Wallet hashes stored as-is in `tracked_entities.external_identifier`
 
 **Rule:** When adding a new exchange or data source, add a new `<exchange>.py` model file. Never put exchange-specific types in `db.py`.
 
@@ -327,7 +396,8 @@ Full SQL schema is in `/schema.sql`. ORM models live in `app/models/db.py`.
 - Workers log at `INFO` level for normal operation, `WARNING` for skipped items, `ERROR` for failures.
 - Workers must not crash the process on errors — wrap the body in `try/except Exception` and log.
 - Ingestion order matters: always sync `series → events → markets → outcomes` in sequence. Markets reference events; events reference series.
-- **Startup behavior**: DEV_MODE=True runs `run_kalshi_dev_sync()` on FastAPI startup before the WS connects. DEV_MODE=False (production) does NOT run any sync on startup — arq handles full sync on its 15min schedule. The WebSocket firehose starts as a background asyncio task in the web process in both modes.
+- **Startup behavior (DEV_MODE=True)**: Kalshi sync is disabled entirely. Polymarket dev sync runs as a background `asyncio.create_task` — server starts immediately, sync + WS subscribe happen in background. arq worker process still must be started separately for state reconciliation cron.
+- **Startup behavior (DEV_MODE=False)**: No sync on startup — arq handles scheduling. Polymarket WS starts immediately using token IDs loaded from DB. Kalshi WS is currently disabled (`ws_task = None`).
 - **Write separation:** tick-level price data → Redis HSET (`ticker:{exchange}:{asset_id}`). Metadata → PostgreSQL. Live candles → Redis HSET (`candle:kalshi:{ticker}:{min_ts}`, 5-min TTL).
 - **Batch upserts via UNNEST**: ingest.py builds column arrays and uses `conn.execute(INSERT ... SELECT unnest($1::uuid[]), ...)` for bulk upserts in a single round-trip. Falls back to row-by-row on error to isolate bad rows.
 - **MVE filtering**: tickers starting with `KXMVE` are multivariate event (parlay/combo) markets — skipped at ingest to avoid DB bloat. Check `_is_mve(ticker)` in `ingest.py`.
@@ -357,28 +427,26 @@ Full SQL schema is in `/schema.sql`. ORM models live in `app/models/db.py`.
 - **None price fallback**: Kalshi `price.open/high/low/close` fields are `None` when no actual trades occurred in a period. Fall back to `(yes_bid.open + yes_ask.open) / 2` midpoint. Never skip periods — fall through to the bid/ask midpoint check.
 - **market_ticker is required for live candle**: The candlestick endpoint accepts optional `market_ticker` query param. Without it, `market_tickers=[]` and the live Redis candle is not fetched — only historical data is returned.
 
-### DEV_MODE — Free-Tier Infrastructure Sandbox
+### DEV_MODE — Railway Pro Sandbox
 
 **When DEV_MODE=True:**
-- **Scope**: Only 3 series tracked: `KXHIGHNY` (Weather), `KXCPI` (Economics), `KXNBAPLAYOFF` (Sports)
-- **Dev config**: `app/core/dev_config.py` defines `DEV_TARGET_SERIES` (static list) and `DEV_TARGET_MARKETS` (mutable list, `.clear()` + `.extend()` at startup)
-- **Startup flow**: `run_kalshi_dev_sync()` runs before WS connects → syncs 3 series → fetches `status="open"` events only (fast: ~10s) → builds `DEV_TARGET_MARKETS` list → WS subscribes to those markets only
-- **WebSocket**: `_dev_enqueue_ticker()` writes to `_latest_ticks` dict (overwrites, no queue needed); `_dev_redis_flusher()` sleeps 1.5s then snapshots/clears dict and flushes via single pipeline — guarantees ≤60 Redis ops/sec
-- **Subscribe message**: `{"id": 1, "cmd": "subscribe", "params": {"channels": ["ticker", "market_lifecycle_v2"], "market_tickers": [...DEV_TARGET_MARKETS]}}`
-- **arq crons**: All cron jobs disabled (`WorkerSettings.cron_jobs = []`) — manually trigger via `POST /api/v1/dev/sync-kalshi`
-- **Dev endpoint**: `app/api/routes/v1/dev.py::POST /api/v1/dev/sync-kalshi` — calls `run_kalshi_dev_sync()`, returns `{"status": "ok", "target_markets_count": N}`, returns 403 if DEV_MODE=False
-- **Redis ops budget**: pipeline commands count individually toward limit. Never use `asyncio.gather` for concurrent EVAL calls — causes "max number of clients reached" on Redis Cloud. Always pipeline.
+- **Kalshi**: All Kalshi sync and WebSocket are disabled. `DEV_EXPLICIT_SERIES` dict is defined but all entries are commented out. `DEV_TARGET_SERIES` and `DEV_TARGET_MARKETS` remain empty.
+- **Polymarket startup**: `run_polymarket_dev_sync()` runs as a background `asyncio.create_task` — server starts immediately while sync runs in background. Syncs the 5 slugs in `POLYMARKET_DEV_SERIES_SLUGS`, caps at 4 events per series. After sync completes, builds token→event map and starts Polymarket CLOB WS.
+- **Dev config**: `app/core/dev_config.py` defines `POLYMARKET_DEV_SERIES_SLUGS` (5 curated slugs), `DEV_REDIS_FLUSH_INTERVAL` (0.5s), mutable `POLYMARKET_DEV_TOKEN_IDS` + `POLYMARKET_DEV_EVENT_IDS` (populated at startup)
+- **arq crons**: Only `run_polymarket_state_reconciliation` (every 2 minutes). All Kalshi crons disabled. **arq worker process is still required in DEV_MODE** — run `arq app.core.arq_worker.WorkerSettings` alongside uvicorn.
+- **Dev endpoint**: `POST /api/v1/dev/sync/{exchange}` — returns 403 in prod
+
+**Polymarket DEV series (5 slugs in `POLYMARKET_DEV_SERIES_SLUGS`):**
+- `trump-approval-positive` — Politics, binary approval rating
+- `trump-negative-approval` — Politics
+- `us-annual-inflation` — Economics, recurring monthly
+- `unemployment` — Economics
+- `solana-hit-price-monthly` — Crypto, price range markets
 
 **When DEV_MODE=False (production):**
-- Global firehose subscription (no `market_tickers` filter)
-- Production micro-batching: asyncio.Queue + 100ms/500-item flusher
-- All arq crons enabled
-- `POST /api/v1/dev/sync-kalshi` returns HTTP 403
-
-**Critical for free-tier Redis Cloud:**
-- Pipeline commands are each counted separately toward ops/sec limit
-- `asyncio.gather` for concurrent EVAL calls causes "max number of clients reached" — always use pipeline instead
-- In dev mode, even a single missed debounce cycle is safe because the flusher resets every 1.5s
+- Polymarket WS: loads all token IDs from DB immediately, subscribes to full production set
+- All arq crons enabled (full Kalshi suite + Polymarket reconciliation every 2min)
+- `POST /api/v1/dev/sync/{exchange}` returns HTTP 403
 
 ---
 
@@ -470,7 +538,7 @@ DEV_MODE=false  # Set to true for local/free-tier development (restricts ingesti
 6. Background worker — injury detection running every 5 minutes
 7. OpenAI synthesis — plain English explanations generating
 8. Firebase notifications — push firing on real injury events
-9. Polymarket data ingestion — whale watching, sharp trader scoring
+9. ✅ Polymarket data ingestion — CLOB WS + Gamma API sync working; GIN-indexed array taxonomy (categories/tags/series_ids); PlatformTag table (unified, parent_ids ARRAY); SportsMetadata table; state reconciliation cron (every 2min, DEV + prod); resolution detection via CLOB WS last_trade_price signals
 10. Group betting social layer — simultaneous individual trade coordination
 11. Full API ready for iOS consumption
 

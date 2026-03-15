@@ -8,7 +8,8 @@ joining, and merging live ticker data from Redis.
 from typing import Optional
 from uuid import UUID
 
-from sqlalchemy import distinct, select
+import redis.asyncio as aioredis
+from sqlalchemy import distinct, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload, joinedload
 
@@ -31,26 +32,29 @@ async def list_categories(
     exchange: str,
     db: AsyncSession,
 ) -> list[str]:
-    """Return sorted distinct categories for active events on an exchange."""
+    """Return sorted distinct category slugs for active events on an exchange.
+
+    Unnests the ARRAY(text) categories column to get individual slug values.
+    """
     result = await db.execute(
-        select(distinct(Event.category))
-        .where(
-            Event.exchange == exchange,
-            Event.status == "active",
-            Event.is_deleted == False,
-            Event.category.isnot(None),
-        )
-        .order_by(Event.category)
+        text(
+            "SELECT DISTINCT unnest(categories) AS cat FROM events "
+            "WHERE exchange = :exchange AND status = 'active' "
+            "AND is_deleted = false AND categories IS NOT NULL "
+            "ORDER BY cat"
+        ),
+        {"exchange": exchange},
     )
-    return [row[0] for row in result.all()]
+    return [row[0] for row in result.all() if row[0]]
 
 
 async def list_events_feed(
     exchange: str,
     db: AsyncSession,
     cache: MarketCacheManager,
-    category: Optional[str] = None,
-    series_ticker: Optional[str] = None,
+    categories: Optional[list[str]] = None,
+    tags: Optional[list[str]] = None,
+    series_tickers: Optional[list[str]] = None,
     sort: str = "volume",
     limit: int = 50,
     offset: int = 0,
@@ -58,17 +62,28 @@ async def list_events_feed(
     """
     Fetch event feed with sorting, pagination, and live Redis prices for lead markets.
 
+    categories/tags/series_tickers use OR logic — events matching ANY value are returned.
+
     Returns (items, count) where items are dicts ready for response serialization.
     """
     stmt = select(Event).where(Event.exchange == exchange, Event.is_deleted == False)
 
-    if category:
-        stmt = stmt.where(Event.category == category)
+    # GIN && overlap filters — OR logic: event must contain at least one of the provided slugs
+    if categories:
+        stmt = stmt.where(Event.categories.overlap(categories))
+    if tags:
+        stmt = stmt.where(Event.tags.overlap(tags))
 
-    if series_ticker:
-        stmt = stmt.join(Series, Event.series_id == Series.id).where(
-            Series.ext_id == series_ticker,
+    if series_tickers:
+        # Resolve provided series tickers → UUID array, then filter events where
+        # series_ids overlaps (&&) that array (OR logic — any series matches)
+        # Renders as: events.series_ids && ARRAY(SELECT id FROM series WHERE ext_id = ANY(...))
+        series_id_select = select(Series.id).where(
+            Series.ext_id.in_(series_tickers),
             Series.is_deleted == False,
+        )
+        stmt = stmt.where(
+            Event.series_ids.overlap(func.array(series_id_select))
         )
 
     if sort == "closing_soon":
@@ -122,11 +137,13 @@ async def list_events_feed(
             yes_price = yes_data.get("price")
             no_price = no_data.get("price")
 
+        # Use first category slug as display category for backward compat
+        display_category = (e.categories[0] if e.categories else None)
         items.append({
             "id": e.id,
             "ext_id": e.ext_id,
             "title": e.title,
-            "category": e.category,
+            "category": display_category,
             "status": e.status,
             "close_time": e.close_time,
             "volume_24h": e.volume_24h,
@@ -215,12 +232,13 @@ async def get_event_detail(
             "outcomes": outcome_details,
         })
 
+    display_category = (event.categories[0] if event.categories else None)
     return {
         "id": event.id,
         "ext_id": event.ext_id,
         "title": event.title,
         "description": event.description,
-        "category": event.category,
+        "category": display_category,
         "status": event.status,
         "close_time": event.close_time,
         "expected_expiration_time": event.expected_expiration_time,
@@ -228,3 +246,64 @@ async def get_event_detail(
         "image_url": event.image_url,
         "markets": market_details,
     }
+
+
+async def get_trending_events(
+    redis_conn: aioredis.Redis,
+    db: AsyncSession,
+    exchange: str,
+    limit: int = 20,
+) -> list[dict]:
+    """
+    Fetch trending events by reading the exchange-specific events_trending_24h_{exchange}
+    Redis ZSET (maintained by each exchange's WebSocket flusher) and hydrating from Postgres.
+
+    Returns event dicts ordered by descending 24h volume, filtered to the given exchange.
+    """
+    zset_key = f"events_trending_24h_{exchange}"
+
+    # ZREVRANGE returns members sorted by score descending (highest volume first)
+    trending_ext_ids = await redis_conn.zrevrange(
+        zset_key, 0, limit - 1, withscores=True,
+    )
+
+    if not trending_ext_ids:
+        return []
+
+    # trending_ext_ids is list of (member, score) tuples
+    ext_id_list = [member for member, _score in trending_ext_ids]
+    score_map = {member: score for member, score in trending_ext_ids}
+
+    # Point lookup in Postgres — filter by exchange for correctness
+    result = await db.execute(
+        select(Event)
+        .where(
+            Event.ext_id.in_(ext_id_list),
+            Event.exchange == exchange,
+            Event.is_deleted == False,
+        )
+    )
+    events_by_ext = {e.ext_id: e for e in result.scalars().all()}
+
+    # Build response preserving ZSET order
+    items = []
+    for ext_id in ext_id_list:
+        e = events_by_ext.get(ext_id)
+        if e is None:
+            continue
+        display_category = (e.categories[0] if e.categories else None)
+        items.append({
+            "id": e.id,
+            "ext_id": e.ext_id,
+            "title": e.title,
+            "category": display_category,
+            "status": e.status,
+            "close_time": e.close_time,
+            "volume_24h": score_map.get(ext_id, 0),
+            "image_url": e.image_url,
+            "event_image_url": e.event_image_url,
+            "featured_image_url": e.featured_image_url,
+            "competition": e.competition,
+        })
+
+    return items

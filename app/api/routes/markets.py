@@ -11,7 +11,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, ConfigDict
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -75,11 +75,8 @@ def _outcome_to_response(o: MarketOutcome) -> OutcomeResponse:
 
 def _row_to_response(row: Market, include_outcomes: bool = False) -> MarketResponse:
     event_ticker = row.event.ext_id if row.event else None
-    series_ticker = (
-        row.event.series.ext_id
-        if row.event and row.event.series
-        else None
-    )
+    # series_ids is now an ARRAY(UUID) — series_ticker not denormalized here
+    series_ticker = None
     outcomes = None
     if include_outcomes and row.outcomes is not None:
         outcomes = [_outcome_to_response(o) for o in row.outcomes]
@@ -115,6 +112,8 @@ async def list_markets(
     ),
     event_ticker: Optional[str] = Query(default=None, description="Filter by parent event ticker"),
     series_ticker: Optional[str] = Query(default=None, description="Filter by grandparent series ticker"),
+    category_id: Optional[UUID] = Query(default=None, description="Filter by category UUID (via parent event)"),
+    tag_id: Optional[UUID] = Query(default=None, description="Filter by tag UUID (via parent event, Polymarket only)"),
     limit: int = Query(default=200, ge=1, le=1000),
     db: AsyncSession = Depends(get_db),
 ) -> MarketListResponse:
@@ -128,7 +127,7 @@ async def list_markets(
     stmt = (
         select(Market)
         .options(
-            selectinload(Market.event).selectinload(Event.series),
+            selectinload(Market.event),
         )
         .where(Market.is_deleted == False)
     )
@@ -137,18 +136,37 @@ async def list_markets(
         stmt = stmt.where(Market.exchange == exchange)
     if status:
         stmt = stmt.where(Market.status == status)
+    # Track whether we've already joined the Event table
+    event_joined = False
+
     if event_ticker:
         stmt = stmt.join(Event, Market.event_id == Event.id).where(
             Event.ext_id == event_ticker,
         )
+        event_joined = True
     elif series_ticker:
-        # series_ticker requires joining up through events → series
-        stmt = (
-            stmt
-            .join(Event, Market.event_id == Event.id)
-            .join(Series, Event.series_id == Series.id)
-            .where(Series.ext_id == series_ticker)
+        # events.series_ids is now ARRAY(UUID) — resolve ticker → id, filter via overlap
+        series_id_subq = select(Series.id).where(
+            Series.ext_id == series_ticker,
+            Series.is_deleted == False,
+        ).scalar_subquery()
+        stmt = stmt.where(
+            Event.series_ids.overlap(func.array(series_id_subq))
         )
+        if not event_joined:
+            stmt = stmt.join(Event, Market.event_id == Event.id)
+            event_joined = True
+
+    if category_id:
+        if not event_joined:
+            stmt = stmt.join(Event, Market.event_id == Event.id)
+            event_joined = True
+        stmt = stmt.where(Event.category_ids.any(category_id))
+    if tag_id:
+        if not event_joined:
+            stmt = stmt.join(Event, Market.event_id == Event.id)
+            event_joined = True
+        stmt = stmt.where(Event.tag_ids.any(tag_id))
 
     stmt = stmt.order_by(Market.close_time.desc().nullslast()).limit(limit)
 
@@ -174,7 +192,7 @@ async def get_market_by_ticker(
     result = await db.execute(
         select(Market)
         .options(
-            selectinload(Market.event).selectinload(Event.series),
+            selectinload(Market.event),
             selectinload(Market.outcomes),
         )
         .where(
