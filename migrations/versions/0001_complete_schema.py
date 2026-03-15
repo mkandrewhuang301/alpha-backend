@@ -169,6 +169,18 @@ def upgrade() -> None:
         op.create_index("idx_series_categories_gin", "series",
                         ["categories"], postgresql_using="gin")
         op.create_index("idx_series_tags_gin", "series", ["tags"], postgresql_using="gin")
+    else:
+        # Table exists — add ARRAY columns if missing (upgrade from pre-Polymarket schema)
+        cols = {c["name"] for c in insp.get_columns("series")}
+        idxs = {i["name"] for i in insp.get_indexes("series")}
+        if "categories" not in cols:
+            op.add_column("series", sa.Column("categories", postgresql.ARRAY(sa.String()), nullable=True))
+        if "tags" not in cols:
+            op.add_column("series", sa.Column("tags", postgresql.ARRAY(sa.String()), nullable=True))
+        if "idx_series_categories_gin" not in idxs:
+            op.create_index("idx_series_categories_gin", "series", ["categories"], postgresql_using="gin")
+        if "idx_series_tags_gin" not in idxs:
+            op.create_index("idx_series_tags_gin", "series", ["tags"], postgresql_using="gin")
 
     # ---------------------------------------------------------------- events
     if not _table_exists(insp, "events"):
@@ -217,6 +229,22 @@ def upgrade() -> None:
             "idx_active_events", "events", ["exchange", "close_time"],
             postgresql_where=sa.text("status = 'active'"),
         )
+    else:
+        # Table exists — add ARRAY columns if missing (upgrade from pre-Polymarket schema)
+        cols = {c["name"] for c in insp.get_columns("events")}
+        idxs = {i["name"] for i in insp.get_indexes("events")}
+        if "categories" not in cols:
+            op.add_column("events", sa.Column("categories", postgresql.ARRAY(sa.String()), nullable=True))
+        if "tags" not in cols:
+            op.add_column("events", sa.Column("tags", postgresql.ARRAY(sa.String()), nullable=True))
+        if "series_ids" not in cols:
+            op.add_column("events", sa.Column("series_ids", postgresql.ARRAY(postgresql.UUID()), nullable=True))
+        if "idx_events_categories_gin" not in idxs:
+            op.create_index("idx_events_categories_gin", "events", ["categories"], postgresql_using="gin")
+        if "idx_events_tags_gin" not in idxs:
+            op.create_index("idx_events_tags_gin", "events", ["tags"], postgresql_using="gin")
+        if "idx_events_series_ids_gin" not in idxs:
+            op.create_index("idx_events_series_ids_gin", "events", ["series_ids"], postgresql_using="gin")
 
     # --------------------------------------------------------------- markets
     if not _table_exists(insp, "markets"):

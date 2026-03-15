@@ -37,14 +37,13 @@ async def list_categories(
     Unnests the ARRAY(text) categories column to get individual slug values.
     """
     result = await db.execute(
-        select(distinct(func.unnest(Event.categories)))
-        .where(
-            Event.exchange == exchange,
-            Event.status == "active",
-            Event.is_deleted == False,
-            Event.categories.isnot(None),
-        )
-        .order_by(func.unnest(Event.categories))
+        text(
+            "SELECT DISTINCT unnest(categories) AS cat FROM events "
+            "WHERE exchange = :exchange AND status = 'active' "
+            "AND is_deleted = false AND categories IS NOT NULL "
+            "ORDER BY cat"
+        ),
+        {"exchange": exchange},
     )
     return [row[0] for row in result.all() if row[0]]
 

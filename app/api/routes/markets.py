@@ -11,7 +11,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, ConfigDict
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -75,11 +75,8 @@ def _outcome_to_response(o: MarketOutcome) -> OutcomeResponse:
 
 def _row_to_response(row: Market, include_outcomes: bool = False) -> MarketResponse:
     event_ticker = row.event.ext_id if row.event else None
-    series_ticker = (
-        row.event.series.ext_id
-        if row.event and row.event.series
-        else None
-    )
+    # series_ids is now an ARRAY(UUID) — series_ticker not denormalized here
+    series_ticker = None
     outcomes = None
     if include_outcomes and row.outcomes is not None:
         outcomes = [_outcome_to_response(o) for o in row.outcomes]
@@ -130,7 +127,7 @@ async def list_markets(
     stmt = (
         select(Market)
         .options(
-            selectinload(Market.event).selectinload(Event.series),
+            selectinload(Market.event),
         )
         .where(Market.is_deleted == False)
     )
@@ -148,13 +145,17 @@ async def list_markets(
         )
         event_joined = True
     elif series_ticker:
-        stmt = (
-            stmt
-            .join(Event, Market.event_id == Event.id)
-            .join(Series, Event.series_id == Series.id)
-            .where(Series.ext_id == series_ticker)
+        # events.series_ids is now ARRAY(UUID) — resolve ticker → id, filter via overlap
+        series_id_subq = select(Series.id).where(
+            Series.ext_id == series_ticker,
+            Series.is_deleted == False,
+        ).scalar_subquery()
+        stmt = stmt.where(
+            Event.series_ids.overlap(func.array(series_id_subq))
         )
-        event_joined = True
+        if not event_joined:
+            stmt = stmt.join(Event, Market.event_id == Event.id)
+            event_joined = True
 
     if category_id:
         if not event_joined:
@@ -191,7 +192,7 @@ async def get_market_by_ticker(
     result = await db.execute(
         select(Market)
         .options(
-            selectinload(Market.event).selectinload(Event.series),
+            selectinload(Market.event),
             selectinload(Market.outcomes),
         )
         .where(
