@@ -74,6 +74,11 @@ FLUSH_INTERVAL = 0.1    # 100ms
 BATCH_SIZE = 500
 QUEUE_MAX_SIZE = 100_000
 
+# TTL for ticker keys in Redis (48 hours).
+# Active markets refresh this on every price update — they never actually expire.
+# Resolved / archived markets stop receiving WS events and self-prune after 48h.
+TICKER_KEY_TTL = 48 * 3600
+
 # Caps concurrent Gamma API + Supabase round-trips for resolution checks.
 # Matches Kalshi's _lifecycle_semaphore(3) pattern.
 _lifecycle_semaphore = asyncio.Semaphore(3)
@@ -651,6 +656,10 @@ async def _redis_flusher(redis_conn) -> None:
                     break
 
             # Phase 1: HSET all ticker data
+            # NOTE: volume_24h is NOT written here — it is owned by the
+            # reconciliation cron (populated from Gamma API REST, every 2min).
+            # The CLOB WebSocket never transmits volume; writing "0" here would
+            # overwrite the cron-set value on every price update.
             pipe = redis_conn.pipeline(transaction=False)
             for u in batch:
                 mapping = {
@@ -659,7 +668,6 @@ async def _redis_flusher(redis_conn) -> None:
                     "bid_size": u.bid_size,
                     "ask": u.ask,
                     "ask_size": u.ask_size,
-                    "volume_24h": u.volume_24h,
                     "ts": u.ts,
                 }
                 # Include optional lifecycle fields when present
@@ -671,6 +679,9 @@ async def _redis_flusher(redis_conn) -> None:
                     mapping["tick_size"] = u.tick_size
 
                 pipe.hset(u.redis_key, mapping=mapping)
+                # Refresh TTL on every write so active markets never expire.
+                # Resolved/archived markets stop receiving updates and self-prune after 48h.
+                pipe.expire(u.redis_key, TICKER_KEY_TTL)
             await pipe.execute()
 
             # Phase 2: ZADD trending leaderboard per event

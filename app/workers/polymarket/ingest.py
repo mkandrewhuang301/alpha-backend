@@ -1165,18 +1165,27 @@ async def build_token_event_map() -> dict[str, str]:
 
 async def run_polymarket_state_reconciliation() -> dict:
     """
-    Delta sync: check Polymarket markets for status/resolution changes.
+    Delta sync: check Polymarket markets for status/resolution changes AND refresh volume.
 
-    Queries the Gamma API for recently closed/resolved markets and updates
-    their status and result in the DB. Intended as a periodic arq cron job
-    (every 5 minutes in production).
+    Queries the Gamma API for all active markets and:
+      1. Updates status/result in DB for resolved/closed markets.
+      2. Refreshes volume_24h in DB (markets table) from Gamma API market.volume24hr.
+      3. Writes volume_24h to Redis HSET for each token so the frontend sees live volume.
+      4. Updates events_trending_24h_polymarket ZSET (summed per event for trending endpoint).
 
-    Returns a stats dict: {"checked": N, "updated": N}.
+    The CLOB WebSocket does NOT transmit volume — this cron is the authoritative
+    source of volume data for Redis. Runs every 2 min (DEV) / 2 min (prod).
+
+    Returns a stats dict: {"checked": N, "updated": N, "volume_refreshed": N}.
     """
     logger.info("[polymarket.ingest] Starting state reconciliation...")
     pool = await get_asyncpg_pool()
+    from app.core.redis import get_redis
+    from app.core.market_cache import _make_key
+    redis_conn = await get_redis()
     checked = 0
     updated = 0
+    volume_refreshed = 0
 
     try:
         # Pull all non-resolved polymarket markets from our DB
@@ -1205,6 +1214,12 @@ async def run_polymarket_state_reconciliation() -> dict:
 
         batch_size = 20
         updates: list[tuple] = []  # (condition_id, new_status, result)
+        # Volume data collected from Gamma API response for Redis + DB refresh
+        # Maps condition_id → (volume_24h_float, [token_id, ...])
+        volume_data: dict[str, tuple[float, list[str]]] = {}
+        # event_ext_id → summed volume (for trending ZSET)
+        event_volumes: dict[str, float] = {}
+        event_ext_id_map = {r["ext_id"]: r["event_ext_id"] for r in rows}
 
         async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as client:
             for i in range(0, len(condition_ids), batch_size):
@@ -1255,13 +1270,35 @@ async def run_polymarket_state_reconciliation() -> dict:
                         if new_status != db_status_map.get(condition_id):
                             updates.append((condition_id, new_status, winning_outcome))
 
+                        # --- Volume refresh ---
+                        # Gamma API provides volume24hr (rolling 24h) and volume (total).
+                        # We use volume24hr as the primary display metric.
+                        vol24 = float(mkt.get("volume24hr") or mkt.get("volume") or 0)
+                        token_ids_raw = (
+                            mkt.get("clobTokenIds") or mkt.get("clob_token_ids") or []
+                        )
+                        if isinstance(token_ids_raw, str):
+                            try:
+                                token_ids_raw = _json.loads(token_ids_raw)
+                            except Exception:
+                                token_ids_raw = []
+                        token_ids_list = [str(t) for t in token_ids_raw if t]
+                        volume_data[condition_id] = (vol24, token_ids_list)
+
+                        # Accumulate event-level volume for trending ZSET
+                        event_ext_id = event_ext_id_map.get(condition_id)
+                        if event_ext_id and vol24 > 0:
+                            event_volumes[event_ext_id] = (
+                                event_volumes.get(event_ext_id, 0.0) + vol24
+                            )
+
                 except Exception as exc:
                     logger.warning(
                         "[polymarket.ingest] Batch reconciliation error: %s", exc
                     )
                     continue
 
-        # Apply updates
+        # Apply status/resolution updates to DB
         if updates:
             now = datetime.now(timezone.utc)
             async with pool.acquire() as conn:
@@ -1282,7 +1319,60 @@ async def run_polymarket_state_reconciliation() -> dict:
                 "[polymarket.ingest] State reconciliation: updated %d / %d markets",
                 updated, checked,
             )
-        else:
+
+        # --- Refresh volume_24h in DB and Redis ---
+        # DB: bulk-update markets.volume_24h from Gamma API data
+        vol_db_rows = [
+            (cid, Decimal(str(vol)), datetime.now(timezone.utc))
+            for cid, (vol, _) in volume_data.items()
+            if vol > 0
+        ]
+        if vol_db_rows:
+            async with pool.acquire() as conn:
+                await conn.executemany(
+                    """
+                    UPDATE markets
+                    SET volume_24h = $2::numeric,
+                        volume     = $2::numeric,
+                        updated_at = $3
+                    WHERE exchange = 'polymarket'
+                      AND ext_id = $1
+                      AND is_deleted = FALSE
+                    """,
+                    vol_db_rows,
+                )
+
+        # Redis: write volume_24h to HSET for each token (one pipeline)
+        redis_vol_writes = [
+            (cid, vol, tids)
+            for cid, (vol, tids) in volume_data.items()
+            if vol > 0 and tids
+        ]
+        if redis_vol_writes:
+            pipe = redis_conn.pipeline(transaction=False)
+            _TICKER_TTL = 48 * 3600  # 48h — same as stream.py TICKER_KEY_TTL
+            for _cid, vol, tids in redis_vol_writes:
+                vol_str = str(int(vol))
+                for token_id in tids:
+                    key = _make_key(EXCHANGE, token_id)
+                    pipe.hset(key, mapping={"volume_24h": vol_str})
+                    pipe.expire(key, _TICKER_TTL)
+            await pipe.execute()
+            volume_refreshed = sum(len(tids) for _, _, tids in redis_vol_writes)
+
+        # Trending ZSET: update events_trending_24h_polymarket with summed event volumes
+        if event_volumes:
+            pipe2 = redis_conn.pipeline(transaction=False)
+            for evt_id, vol in event_volumes.items():
+                pipe2.zadd("events_trending_24h_polymarket", {evt_id: vol})
+            await pipe2.execute()
+
+        logger.info(
+            "[polymarket.ingest] Volume refreshed: %d tokens across %d events (trending updated)",
+            volume_refreshed, len(event_volumes),
+        )
+
+        if not updates:
             logger.info(
                 "[polymarket.ingest] State reconciliation: %d markets checked, none changed.",
                 checked,
@@ -1291,7 +1381,7 @@ async def run_polymarket_state_reconciliation() -> dict:
     except Exception as exc:
         logger.error("[polymarket.ingest] State reconciliation failed: %s", exc, exc_info=True)
 
-    return {"checked": checked, "updated": updated}
+    return {"checked": checked, "updated": updated, "volume_refreshed": volume_refreshed}
 
 
 # ---------------------------------------------------------------------------
