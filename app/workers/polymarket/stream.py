@@ -398,18 +398,11 @@ def _handle_new_market_message(msg: dict) -> None:
     """
     Handle a 'new_market' WS event (requires custom_feature_enabled: true).
 
-    We can't subscribe to the new tokens without reconnecting, so we log
-    the event. The Polymarket state reconciliation cron (every 2min in DEV,
+    We can't subscribe to the new tokens without reconnecting.
+    The Polymarket state reconciliation cron (every 2min in DEV,
     every 2min in prod) will pick up new markets on its next run.
     """
-    question = str(msg.get("question") or "unknown")
-    slug = str(msg.get("slug") or "")
-    assets_ids = msg.get("assets_ids") or []
-    logger.info(
-        "[polymarket.stream] new_market detected: '%s' (slug=%s, %d assets) — "
-        "will be ingested on next reconciliation run",
-        question[:80], slug, len(assets_ids),
-    )
+    pass
 
 
 def _parse_and_enqueue(msg: dict) -> None:
@@ -724,10 +717,19 @@ async def _redis_flusher(redis_conn) -> None:
                     len(candidates),
                 )
 
-            logger.debug(
-                "[polymarket.stream] Flushed %d ticker updates (%d unique tokens)",
+            unique_tokens = {u.token_id for u in batch}
+            # Sample one update per unique token for logging
+            sample_by_token = {u.token_id: u for u in batch}
+            price_summary = ", ".join(
+                f"{tid[:12]}…=price:{u.price} bid:{u.bid} ask:{u.ask}"
+                for tid, u in list(sample_by_token.items())[:5]
+            )
+            logger.info(
+                "[polymarket.stream] Flushed %d updates | %d tokens | %s%s",
                 len(batch),
-                len({u.token_id for u in batch}),
+                len(unique_tokens),
+                price_summary,
+                f" +{len(unique_tokens) - 5} more" if len(unique_tokens) > 5 else "",
             )
 
         except asyncio.CancelledError:

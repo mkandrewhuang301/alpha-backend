@@ -4,6 +4,26 @@
 
 ---
 
+## gstack
+
+Use the `/browse` skill from gstack for all web browsing. Never use `mcp__claude-in-chrome__*` tools.
+
+If gstack skills aren't working, run `cd ~/.claude/skills/gstack && ./setup` to build the binary and register skills.
+
+### Available skills
+- `/browse` — browse the web with a headless Chromium browser
+- `/plan-ceo-review` — review a plan from a CEO/product perspective
+- `/plan-eng-review` — review a plan from an engineering perspective
+- `/review` — code review
+- `/ship` — ship code (review + merge)
+- `/qa` — QA testing with browser automation
+- `/qa-only` — QA testing only (no code changes)
+- `/setup-browser-cookies` — set up browser cookies for authenticated browsing
+- `/retro` — run a retrospective
+- `/gstack-upgrade` — upgrade gstack to the latest version
+
+---
+
 ## What Is Alpha
 
 Alpha is a consumer iOS prediction market intelligence app for mainstream sports bettors. Think Action Network meets eToro meets Bloomberg Terminal — but for regular people who just want to feel informed enough to trade confidently on Kalshi and Polymarket.
