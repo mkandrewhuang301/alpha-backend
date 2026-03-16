@@ -69,6 +69,17 @@ EXCHANGE = "polymarket"
 MAX_BACKOFF = 60
 INITIAL_BACKOFF = 1
 
+# Receive timeout: if no WS message arrives within this window, assume the
+# connection is dead and force a reconnect.  The Polymarket CLOB firehose is
+# high-throughput — silence for 60s means something broke (network partition,
+# silent LB timeout, server-side drop without RST).
+RECEIVE_TIMEOUT = 60  # seconds
+
+# Periodic re-subscribe: reconnect with a fresh token list from the DB so that
+# new markets discovered by the reconciliation cron get real-time WS coverage
+# without requiring a full server restart.
+RESUBSCRIBE_INTERVAL = 30 * 60  # 30 minutes
+
 # Micro-batching parameters — same as Kalshi stream
 FLUSH_INTERVAL = 0.1    # 100ms
 BATCH_SIZE = 500
@@ -744,9 +755,55 @@ async def _redis_flusher(redis_conn) -> None:
 # Main WebSocket loop
 # ---------------------------------------------------------------------------
 
+async def _load_active_token_ids() -> list[str]:
+    """
+    Load active (non-resolved, non-canceled) Polymarket token IDs from the DB.
+
+    Filters out resolved/canceled markets so the WS only subscribes to markets
+    that can still receive price updates — avoids wasting subscribe slots.
+    """
+    from app.core.database import get_asyncpg_pool
+
+    pool = await get_asyncpg_pool()
+    try:
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT DISTINCT mo.execution_asset_id
+                FROM market_outcomes mo
+                JOIN markets m ON mo.market_id = m.id
+                WHERE m.exchange = 'polymarket'
+                  AND m.is_deleted = FALSE
+                  AND m.status NOT IN ('resolved', 'canceled')
+                ORDER BY mo.execution_asset_id
+                """,
+            )
+        return [r["execution_asset_id"] for r in rows]
+    except Exception as exc:
+        logger.error("[polymarket.stream] Failed to load active token IDs: %s", exc)
+        return []
+
+
+async def _refresh_token_event_map() -> None:
+    """Reload token→event mapping from the DB and inject into the module-level map."""
+    from app.workers.polymarket.ingest import build_token_event_map
+
+    try:
+        tm = await build_token_event_map()
+        set_token_event_map(tm)
+        logger.info(
+            "[polymarket.stream] Refreshed token→event map (%d entries).", len(tm),
+        )
+    except Exception as exc:
+        logger.warning("[polymarket.stream] Token→event map refresh failed: %s", exc)
+
+
 async def run_polymarket_ws(token_ids: list[str]) -> None:
     """
-    Main Polymarket CLOB WebSocket loop with exponential backoff reconnection.
+    Main Polymarket CLOB WebSocket loop with:
+      - Exponential backoff reconnection on errors
+      - Receive timeout to detect silent connection death
+      - Periodic re-subscribe to pick up new markets from reconciliation cron
 
     Subscribes to the given ERC-1155 token IDs with custom_feature_enabled: true to get:
         - Real-time price/orderbook updates (book, price_change)
@@ -767,6 +824,7 @@ async def run_polymarket_ws(token_ids: list[str]) -> None:
             "to any markets. Run polymarket dev/full sync first."
         )
 
+    active_token_ids = list(token_ids)
     backoff = INITIAL_BACKOFF
     redis_conn = await get_redis()
 
@@ -775,7 +833,7 @@ async def run_polymarket_ws(token_ids: list[str]) -> None:
         "[polymarket.stream] Starting CLOB WebSocket for %d tokens "
         "(custom_feature_enabled: book, price_change, best_bid_ask, "
         "last_trade_price, tick_size_change, market_resolved, new_market)",
-        len(token_ids),
+        len(active_token_ids),
     )
 
     try:
@@ -792,18 +850,38 @@ async def run_polymarket_ws(token_ids: list[str]) -> None:
 
                     subscribe_msg = json.dumps({
                         "type": "market",
-                        "assets_ids": token_ids,
+                        "assets_ids": active_token_ids,
                         "custom_feature_enabled": True,
                     })
                     await ws.send(subscribe_msg)
                     logger.info(
                         "[polymarket.stream] Subscribed to %d tokens "
                         "(all event types, custom_feature_enabled=true)",
-                        len(token_ids),
+                        len(active_token_ids),
                     )
 
                     msg_count = 0
-                    async for raw_msg in ws:
+                    connection_start = time.monotonic()
+
+                    while True:
+                        # ── Receive with timeout ──
+                        # If no message within RECEIVE_TIMEOUT, the connection is
+                        # likely dead (silent drop, LB timeout, network partition).
+                        # Break inner loop → reconnect with fresh token list.
+                        try:
+                            raw_msg = await asyncio.wait_for(
+                                ws.recv(), timeout=RECEIVE_TIMEOUT,
+                            )
+                        except asyncio.TimeoutError:
+                            elapsed = time.monotonic() - connection_start
+                            logger.warning(
+                                "[polymarket.stream] No message for %ds — "
+                                "assuming dead connection (uptime %.0fs, %d msgs). "
+                                "Forcing reconnect.",
+                                RECEIVE_TIMEOUT, elapsed, msg_count,
+                            )
+                            break
+
                         msg_count += 1
                         try:
                             msg = json.loads(raw_msg)
@@ -830,6 +908,49 @@ async def run_polymarket_ws(token_ids: list[str]) -> None:
                         elif isinstance(msg, dict):
                             _parse_and_enqueue(msg)
 
+                        # ── Periodic re-subscribe check ──
+                        # Every RESUBSCRIBE_INTERVAL, reload token IDs from DB
+                        # so new markets from the reconciliation cron get
+                        # real-time WS coverage without a full restart.
+                        elapsed = time.monotonic() - connection_start
+                        if elapsed >= RESUBSCRIBE_INTERVAL:
+                            logger.info(
+                                "[polymarket.stream] Re-subscribe interval reached "
+                                "(%.0fs, %d msgs). Reloading tokens from DB...",
+                                elapsed, msg_count,
+                            )
+                            fresh_ids = await _load_active_token_ids()
+                            if fresh_ids:
+                                prev_count = len(active_token_ids)
+                                prev_set = set(active_token_ids)
+                                new_set = set(fresh_ids)
+                                added = new_set - prev_set
+                                removed = prev_set - new_set
+                                active_token_ids = fresh_ids
+                                await _refresh_token_event_map()
+                                logger.info(
+                                    "[polymarket.stream] Token refresh: %d → %d "
+                                    "(+%d new, -%d resolved). Reconnecting...",
+                                    prev_count, len(active_token_ids),
+                                    len(added), len(removed),
+                                )
+                            else:
+                                logger.warning(
+                                    "[polymarket.stream] DB returned 0 active tokens "
+                                    "— keeping current %d tokens.",
+                                    len(active_token_ids),
+                                )
+                            # Break to reconnect with updated token list
+                            break
+
+                    # Log session summary on clean exit from inner loop
+                    elapsed = time.monotonic() - connection_start
+                    logger.info(
+                        "[polymarket.stream] Session ended: %d msgs in %.0fs (%.1f msg/s)",
+                        msg_count, elapsed,
+                        msg_count / elapsed if elapsed > 0 else 0,
+                    )
+
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -840,6 +961,24 @@ async def run_polymarket_ws(token_ids: list[str]) -> None:
                 )
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, MAX_BACKOFF)
+
+                # On reconnect after error, try refreshing tokens from DB
+                # so we don't keep reconnecting with a stale list.
+                try:
+                    fresh_ids = await _load_active_token_ids()
+                    if fresh_ids:
+                        active_token_ids = fresh_ids
+                        await _refresh_token_event_map()
+                        logger.info(
+                            "[polymarket.stream] Refreshed token list on reconnect: %d active tokens.",
+                            len(active_token_ids),
+                        )
+                except Exception as refresh_exc:
+                    logger.warning(
+                        "[polymarket.stream] Token refresh on reconnect failed: %s — "
+                        "using previous %d tokens.",
+                        refresh_exc, len(active_token_ids),
+                    )
 
     except asyncio.CancelledError:
         logger.info("[polymarket.stream] WS task cancelled, shutting down.")

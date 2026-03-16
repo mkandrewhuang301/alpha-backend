@@ -1124,7 +1124,9 @@ async def load_polymarket_token_ids_from_db() -> list[str]:
                 SELECT DISTINCT mo.execution_asset_id
                 FROM market_outcomes mo
                 JOIN markets m ON mo.market_id = m.id
-                WHERE m.exchange = 'polymarket' AND m.is_deleted = FALSE
+                WHERE m.exchange = 'polymarket'
+                  AND m.is_deleted = FALSE
+                  AND m.status NOT IN ('resolved', 'canceled')
                 ORDER BY mo.execution_asset_id
                 """,
             )
