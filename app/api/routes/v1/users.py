@@ -20,7 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.database import get_db
 from app.models.db import User, Account
 from app.services.magic import verify_did_token
-from app.services.polymarket import derive_proxy_wallet, derive_safe, get_relay_payload, deploy_safe
+from app.services.polymarket import derive_proxy_wallet, derive_safe, get_safe_deploy_payload, deploy_safe
 
 logger = logging.getLogger(__name__)
 
@@ -44,22 +44,23 @@ class RegisterResponse(BaseModel):
 
 
 class SafePayloadResponse(BaseModel):
-    to: str
-    data: str
+    safe_address: str    # EIP-712 verifyingContract
     nonce: str
-    gas_price: str
+    chain_id: int        # 137 (Polygon)
+    to: str              # Safe factory — iOS puts this in SafeTx.to
+    value: str
+    data: str
     operation: str
     safe_txn_gas: str
     base_gas: str
+    gas_price: str
     gas_token: str
     refund_receiver: str
-    safe_address: str
 
 
 class SafeDeployRequest(BaseModel):
     eoa_address: str
     signature: str       # EIP-712 signature from iOS Magic signing
-    payload: dict        # The relay payload returned by /safe/payload
 
 
 class SafeDeployResponse(BaseModel):
@@ -153,22 +154,24 @@ async def get_safe_payload(eoa_address: str):
         eoa_address: User's EOA address from Magic (0x...)
     """
     try:
-        payload = await get_relay_payload(eoa_address)
+        payload = await get_safe_deploy_payload(eoa_address)
     except Exception as e:
         logger.error("Failed to fetch relay payload for eoa=%s: %s", eoa_address, e)
         raise HTTPException(status_code=502, detail=f"Relayer error: {e}")
 
     return SafePayloadResponse(
-        to=payload.to,
-        data=payload.data,
+        safe_address=payload.safe_address,
         nonce=payload.nonce,
-        gas_price=payload.gas_price,
+        chain_id=payload.chain_id,
+        to=payload.to,
+        value=payload.value,
+        data=payload.data,
         operation=payload.operation,
         safe_txn_gas=payload.safe_txn_gas,
         base_gas=payload.base_gas,
+        gas_price=payload.gas_price,
         gas_token=payload.gas_token,
         refund_receiver=payload.refund_receiver,
-        safe_address=payload.safe_address,
     )
 
 
@@ -193,7 +196,6 @@ async def deploy_safe_endpoint(
         result = await deploy_safe(
             eoa_address=body.eoa_address,
             signature=body.signature,
-            payload=body.payload,
         )
     except TimeoutError:
         raise HTTPException(status_code=504, detail="Safe deployment timed out")

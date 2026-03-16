@@ -9,7 +9,12 @@ Handles:
 """
 
 import asyncio
+import base64
+import hashlib
+import hmac
+import json
 import logging
+import time
 from dataclasses import dataclass
 
 import httpx
@@ -21,6 +26,9 @@ from app.core.config import (
     POLYMARKET_RELAYER_URL,
     POLYMARKET_RELAYER_KEY,
     POLYMARKET_RELAYER_ADDRESS,
+    POLYMARKET_API_KEY,
+    POLYMARKET_API_SECRET,
+    POLYMARKET_API_PASSPHRASE,
 )
 
 logger = logging.getLogger(__name__)
@@ -31,11 +39,15 @@ logger = logging.getLogger(__name__)
 
 # Gnosis Safe — requires Polymarket builder relayer access to deploy
 SAFE_FACTORY = "0xaacFeEa03eb1561C4e67d661e40682Bd20E3541b"
+SAFE_FACTORY_NAME = "Polymarket Contract Proxy Factory"
 SAFE_INIT_CODE_HASH = "0x2bce2127ff07fb632d16c8347c4ebf501f4841168bed00d9e6ef715ddb6fcecf"
 
 # Polymarket Proxy wallet — deploys automatically on first transaction, no relayer needed
 PROXY_FACTORY = "0xaB45c5A4B0c941a2F231C04C3f49182e1A254052"
 PROXY_INIT_CODE_HASH = "0xd21df8dc65880a8606f09fe0ce3df9b8869287ab0b058be05aa9e8af6330a00b"
+
+ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
+POLYGON_CHAIN_ID = 137
 
 
 # ---------------------------------------------------------------------------
@@ -50,12 +62,6 @@ def derive_proxy_wallet(eoa_address: str) -> str:
     the same proxy wallet address. No network call required.
 
     Use this until Polymarket builder relayer access is obtained.
-
-    Args:
-        eoa_address: The user's EOA address (0x...)
-
-    Returns:
-        Checksummed proxy wallet address (0x...)
     """
     checksummed = Web3.to_checksum_address(eoa_address)
     salt = Web3.keccak(encode_packed(["address"], [checksummed]))
@@ -76,15 +82,7 @@ def derive_safe(eoa_address: str) -> str:
     the same Safe address. No network call required.
 
     Note: Requires Polymarket builder relayer access to actually deploy.
-    Switch to this from derive_proxy_wallet once builder access is obtained.
-
-    Args:
-        eoa_address: The user's EOA address (0x...)
-
-    Returns:
-        Checksummed Safe address (0x...)
     """
-    # encodeAbiParameters = standard ABI encoding (32-byte padded), NOT packed
     checksummed = Web3.to_checksum_address(eoa_address)
     salt = Web3.keccak(encode(["address"], [checksummed]))
     safe_address = Web3.keccak(
@@ -101,7 +99,7 @@ def derive_safe(eoa_address: str) -> str:
 # ---------------------------------------------------------------------------
 
 def _relayer_headers() -> dict:
-    """Auth headers for all Polymarket relayer requests."""
+    """Auth headers for relayer GET requests."""
     return {
         "RELAYER_API_KEY": POLYMARKET_RELAYER_KEY,
         "RELAYER_API_KEY_ADDRESS": POLYMARKET_RELAYER_ADDRESS,
@@ -109,33 +107,64 @@ def _relayer_headers() -> dict:
     }
 
 
+def _build_hmac_signature(secret: str, timestamp: str, method: str, path: str, body: str = "") -> str:
+    base64_secret = base64.urlsafe_b64decode(secret)
+    message = timestamp + method + path
+    if body:
+        message += body.replace("'", '"')
+    h = hmac.new(base64_secret, message.encode("utf-8"), hashlib.sha256)
+    return base64.urlsafe_b64encode(h.digest()).decode("utf-8")
+
+
+def _builder_headers(method: str, path: str, body: str = "") -> dict:
+    """HMAC auth headers for relayer POST /submit."""
+    timestamp = str(int(time.time() * 1000))  # milliseconds
+    sig = _build_hmac_signature(POLYMARKET_API_SECRET.strip(), timestamp, method, path, body)
+    return {
+        "POLY_BUILDER_SIGNATURE": sig,
+        "POLY_BUILDER_TIMESTAMP": timestamp,
+        "POLY_BUILDER_API_KEY": POLYMARKET_API_KEY.strip(),
+        "POLY_BUILDER_PASSPHRASE": POLYMARKET_API_PASSPHRASE.strip(),
+        "Content-Type": "application/json",
+    }
+
+
 @dataclass
-class RelayPayload:
-    """Payload returned by the relayer that iOS must sign."""
-    to: str
-    data: str
-    nonce: str
-    gas_price: str
-    operation: str
-    safe_txn_gas: str
-    base_gas: str
-    gas_token: str
-    refund_receiver: str
-    safe_address: str
-
-
-async def get_relay_payload(eoa_address: str) -> RelayPayload:
+class SafeDeployPayload:
     """
-    Fetch the Safe deployment payload from Polymarket's relayer.
+    Everything the iOS app needs to construct and sign the EIP-712 SafeTx
+    for Safe deployment, then call POST /users/safe/deploy.
 
-    The returned payload must be signed by the user's EOA (via Magic on iOS).
-    No on-chain interaction — just fetches what needs to be signed.
+    EIP-712 domain: { chainId: 137, verifyingContract: safe_address }
+    EIP-712 type:   SafeTx (standard Gnosis Safe transaction type)
+    """
+    safe_address: str    # verifyingContract in EIP-712 domain
+    nonce: str           # from relayer — always "0" for fresh deploy
+    chain_id: int        # 137 (Polygon mainnet)
+    # SafeTx fields — iOS builds these into the EIP-712 message
+    to: str              # Safe factory address
+    value: str           # "0"
+    data: str            # "0x" (empty)
+    operation: str       # "0" (Call)
+    safe_txn_gas: str    # "0"
+    base_gas: str        # "0"
+    gas_price: str       # "0"
+    gas_token: str       # zero address
+    refund_receiver: str # zero address
+
+
+async def get_safe_deploy_payload(eoa_address: str) -> SafeDeployPayload:
+    """
+    Build everything iOS needs to sign a Safe deployment transaction.
+
+    Fetches the nonce from the relayer, then constructs the full EIP-712
+    SafeTx payload that iOS Magic will sign.
 
     Args:
         eoa_address: User's EOA address (0x...)
 
     Returns:
-        RelayPayload containing all fields needed for iOS to sign + backend to submit
+        SafeDeployPayload with EIP-712 fields ready for iOS to sign
     """
     safe_address = derive_safe(eoa_address)
 
@@ -148,18 +177,23 @@ async def get_relay_payload(eoa_address: str) -> RelayPayload:
         )
         resp.raise_for_status()
         data = resp.json()
+        logger.info("Relayer relay-payload response: %s", data)
 
-    return RelayPayload(
-        to=data.get("to", ""),
-        data=data.get("data", ""),
-        nonce=str(data.get("nonce", "0")),
-        gas_price=str(data.get("gasPrice", "0")),
-        operation=str(data.get("operation", "0")),
-        safe_txn_gas=str(data.get("safeTxnGas", "0")),
-        base_gas=str(data.get("baseGas", "0")),
-        gas_token=data.get("gasToken", "0x0000000000000000000000000000000000000000"),
-        refund_receiver=data.get("refundReceiver", "0x0000000000000000000000000000000000000000"),
+    nonce = str(data.get("nonce", "0"))
+
+    return SafeDeployPayload(
         safe_address=safe_address,
+        nonce=nonce,
+        chain_id=POLYGON_CHAIN_ID,
+        to=SAFE_FACTORY,
+        value="0",
+        data="0x",
+        operation="0",
+        safe_txn_gas="0",
+        base_gas="0",
+        gas_price="0",
+        gas_token=ZERO_ADDRESS,
+        refund_receiver=ZERO_ADDRESS,
     )
 
 
@@ -169,16 +203,16 @@ class SafeDeployResult:
     transaction_hash: str
 
 
-async def deploy_safe(eoa_address: str, signature: str, payload: dict) -> SafeDeployResult:
+async def deploy_safe(eoa_address: str, signature: str) -> SafeDeployResult:
     """
     Submit a signed Safe deployment transaction to Polymarket's relayer.
 
-    Polls until the Safe is confirmed on-chain, then returns the safe_address.
+    iOS signs the EIP-712 SafeTx payload from get_safe_deploy_payload(),
+    then calls this with the resulting signature.
 
     Args:
         eoa_address: User's EOA address
-        signature:   EIP-712 signature from iOS (Magic signed the relay payload)
-        payload:     The relay payload dict originally returned by get_relay_payload()
+        signature:   EIP-712 signature from iOS Magic signing
 
     Returns:
         SafeDeployResult with safe_address and transaction_hash
@@ -187,30 +221,34 @@ async def deploy_safe(eoa_address: str, signature: str, payload: dict) -> SafeDe
 
     body = {
         "from": eoa_address,
-        "to": payload["to"],
+        "to": SAFE_FACTORY,
         "proxyWallet": safe_address,
-        "data": payload["data"],
-        "nonce": payload["nonce"],
+        "data": "0x",
         "signature": signature,
-        "type": "SAFE",
         "signatureParams": {
-            "gasPrice": payload["gas_price"],
-            "operation": payload["operation"],
-            "safeTxnGas": payload["safe_txn_gas"],
-            "baseGas": payload["base_gas"],
-            "gasToken": payload["gas_token"],
-            "refundReceiver": payload["refund_receiver"],
+            "paymentToken": ZERO_ADDRESS,
+            "payment": "0",
+            "paymentReceiver": ZERO_ADDRESS,
         },
+        "type": "SAFE-CREATE",
     }
 
     async with httpx.AsyncClient() as client:
-        # Submit deployment transaction
+        body_str = json.dumps(body)
         resp = await client.post(
             f"{POLYMARKET_RELAYER_URL}/submit",
-            json=body,
-            headers=_relayer_headers(),
+            content=body_str,
+            headers=_builder_headers("POST", "/submit", body_str),
             timeout=15.0,
         )
+        hdrs = _builder_headers("POST", "/submit", body_str)
+        logger.info("=== RELAYER SUBMIT REQUEST ===")
+        logger.info("Headers: %s", hdrs)
+        logger.info("URL: %s/submit", POLYMARKET_RELAYER_URL)
+        logger.info("Body: %s", json.dumps(body, indent=2))
+        logger.info("=== RELAYER SUBMIT RESPONSE ===")
+        logger.info("Status: %s", resp.status_code)
+        logger.info("Body: %s", resp.text)
         resp.raise_for_status()
         submit_data = resp.json()
         transaction_id = submit_data["transactionID"]
@@ -226,7 +264,10 @@ async def deploy_safe(eoa_address: str, signature: str, payload: dict) -> SafeDe
             )
             poll.raise_for_status()
             poll_data = poll.json()
+            if isinstance(poll_data, list):
+                poll_data = poll_data[0] if poll_data else {}
             state = poll_data.get("state", "")
+            logger.info("Poll response: %s", poll_data)
 
             if state == "STATE_MINED":
                 return SafeDeployResult(
@@ -234,6 +275,12 @@ async def deploy_safe(eoa_address: str, signature: str, payload: dict) -> SafeDe
                     transaction_hash=poll_data.get("transactionHash", ""),
                 )
             if state in ("STATE_FAILED", "STATE_REJECTED"):
-                raise ValueError(f"Safe deployment failed: state={state}")
+                error_msg = poll_data.get("errorMsg", "")
+                if "already deployed" in error_msg:
+                    return SafeDeployResult(
+                        safe_address=safe_address,
+                        transaction_hash=poll_data.get("transactionHash", ""),
+                    )
+                raise ValueError(f"Safe deployment failed: state={state}, error={error_msg}")
 
     raise TimeoutError("Safe deployment timed out after 2 minutes")

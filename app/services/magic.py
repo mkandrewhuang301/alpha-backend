@@ -24,7 +24,7 @@ def _get_magic() -> Magic:
     """Singleton Magic client."""
     global _magic
     if _magic is None:
-        _magic = Magic(secret_key=MAGIC_SECRET_KEY)
+        _magic = Magic(api_secret_key=MAGIC_SECRET_KEY)
     return _magic
 
 
