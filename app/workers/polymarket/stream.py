@@ -784,8 +784,7 @@ async def run_polymarket_ws(token_ids: list[str]) -> None:
                 logger.info("[polymarket.stream] Connecting to %s ...", CLOB_WS_URL)
                 async with websockets.connect(
                     CLOB_WS_URL,
-                    ping_interval=20,
-                    ping_timeout=10,
+                    ping_interval=None,   # Polymarket CLOB server doesn't respond to WS pings
                     open_timeout=30,
                 ) as ws:
                     logger.info("[polymarket.stream] Connected.")
@@ -803,7 +802,9 @@ async def run_polymarket_ws(token_ids: list[str]) -> None:
                         len(token_ids),
                     )
 
+                    msg_count = 0
                     async for raw_msg in ws:
+                        msg_count += 1
                         try:
                             msg = json.loads(raw_msg)
                         except json.JSONDecodeError:
@@ -812,6 +813,15 @@ async def run_polymarket_ws(token_ids: list[str]) -> None:
                                 raw_msg[:200],
                             )
                             continue
+
+                        # Log first 3 raw messages to diagnose message format
+                        if msg_count <= 3:
+                            logger.info(
+                                "[polymarket.stream] RAW msg #%d (type=%s): %s",
+                                msg_count,
+                                type(msg).__name__,
+                                raw_msg[:500],
+                            )
 
                         # CLOB WS sends both single dicts and arrays of events
                         if isinstance(msg, list):
