@@ -634,7 +634,7 @@ async def _redis_flusher(redis_conn) -> None:
 
     Phase 1: HSET for all token ticker data in one pipeline.execute().
             Includes last_trade_price, last_trade_side, tick_size when present.
-    Phase 2: ZADD events_trending_24h_polymarket for volume rollup.
+    Phase 2: (Removed) Trending ZADD now handled by reconciliation cron only.
     Phase 3: Fire WS-driven resolution tasks (_ws_resolutions dict) — Path A,
             no Gamma API roundtrip, outcome known from WS event.
     Phase 4: Fire Gamma-confirm resolution tasks (_resolution_candidates) — Path B
@@ -688,21 +688,9 @@ async def _redis_flusher(redis_conn) -> None:
                 pipe.expire(u.redis_key, TICKER_KEY_TTL)
             await pipe.execute()
 
-            # Phase 2: ZADD trending leaderboard per event
-            event_scores: dict[str, float] = {}
-            for u in batch:
-                if u.event_ext_id:
-                    vol = float(u.volume_24h) if u.volume_24h != "0" else 0.0
-                    if vol > 0:
-                        event_scores[u.event_ext_id] = (
-                            event_scores.get(u.event_ext_id, 0.0) + vol
-                        )
-
-            if event_scores:
-                pipe2 = redis_conn.pipeline(transaction=False)
-                for evt, vol in event_scores.items():
-                    pipe2.zadd("events_trending_24h_polymarket", {evt: vol})
-                await pipe2.execute()
+            # Phase 2: ZADD trending — skipped here. Volume comes from the
+            # reconciliation cron (Gamma API REST), not the CLOB WS which never
+            # transmits volume. See run_polymarket_state_reconciliation().
 
             # Phase 3: fire WS-driven resolution tasks (Path A — outcome known)
             if _ws_resolutions:

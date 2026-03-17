@@ -422,8 +422,10 @@ async def _upsert_event(
         except (ValueError, AttributeError):
             pass
 
-    volume = event_dict.get("volume")
-    volume_24h = Decimal(str(volume)) if volume else Decimal(0)
+    # Prefer volume24hr (rolling 24h) over volume (all-time total).
+    # Gamma events expose both; the reconciliation cron keeps this fresh.
+    vol_raw = event_dict.get("volume24hr") or event_dict.get("volume") or 0
+    volume_24h = Decimal(str(vol_raw)) if vol_raw else Decimal(0)
 
     neg_risk = event_dict.get("negRisk") or event_dict.get("neg_risk") or False
     platform_metadata = _json.dumps({
@@ -1361,6 +1363,27 @@ async def run_polymarket_state_reconciliation() -> dict:
                     pipe.expire(key, _TICKER_TTL)
             await pipe.execute()
             volume_refreshed = sum(len(tids) for _, _, tids in redis_vol_writes)
+
+        # Event-level volume_24h refresh: sum market volumes per event → events.volume_24h
+        if event_volumes:
+            vol_event_rows = [
+                (evt_id, Decimal(str(vol)), datetime.now(timezone.utc))
+                for evt_id, vol in event_volumes.items()
+                if vol > 0
+            ]
+            if vol_event_rows:
+                async with pool.acquire() as conn:
+                    await conn.executemany(
+                        """
+                        UPDATE events
+                        SET volume_24h = $2::numeric,
+                            updated_at = $3
+                        WHERE exchange = 'polymarket'
+                          AND ext_id = $1
+                          AND is_deleted = FALSE
+                        """,
+                        vol_event_rows,
+                    )
 
         # Trending ZSET: update events_trending_24h_polymarket with summed event volumes
         if event_volumes:
