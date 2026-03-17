@@ -1522,15 +1522,19 @@ async def run_polymarket_dev_sync() -> list[str]:
             "[polymarket.ingest] DB fallback: %d token IDs loaded", len(db_tokens)
         )
 
-    # 7. Sync tag taxonomy + sports metadata (non-blocking)
-    try:
-        tag_stats = await run_polymarket_tag_sync(pool)
-        logger.info(
-            "[polymarket.ingest] Tag taxonomy synced: %d tags, %d sports",
-            tag_stats["tags"], tag_stats["sports"],
-        )
-    except Exception as exc:
-        logger.warning("[polymarket.ingest] Tag taxonomy sync failed (non-critical): %s", exc)
+    # 7. Tag taxonomy sync — skipped in DEV_MODE (5540 related-tag API calls,
+    #    ~10 minutes, exhausts DB pool). Run via prod cron or manual endpoint.
+    if not DEV_MODE:
+        try:
+            tag_stats = await run_polymarket_tag_sync(pool)
+            logger.info(
+                "[polymarket.ingest] Tag taxonomy synced: %d tags, %d sports",
+                tag_stats["tags"], tag_stats["sports"],
+            )
+        except Exception as exc:
+            logger.warning("[polymarket.ingest] Tag taxonomy sync failed (non-critical): %s", exc)
+    else:
+        logger.info("[polymarket.ingest] DEV_MODE — skipping tag taxonomy sync (too slow for dev)")
 
     return list(POLYMARKET_DEV_TOKEN_IDS)
 

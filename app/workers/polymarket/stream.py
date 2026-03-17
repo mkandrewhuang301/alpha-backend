@@ -413,7 +413,12 @@ def _handle_new_market_message(msg: dict) -> None:
     The Polymarket state reconciliation cron (every 2min in DEV,
     every 2min in prod) will pick up new markets on its next run.
     """
-    pass
+    market_id = msg.get("market_id") or msg.get("id") or ""
+    logger.info(
+        "[polymarket.stream] New market detected via WS: %s — "
+        "will be picked up by reconciliation cron.",
+        market_id or "(no id)",
+    )
 
 
 def _parse_and_enqueue(msg: dict) -> None:
@@ -882,7 +887,7 @@ async def run_polymarket_ws(token_ids: list[str]) -> None:
 
                         # Log first 3 raw messages to diagnose message format
                         if msg_count <= 3:
-                            logger.info(
+                            logger.debug(
                                 "[polymarket.stream] RAW msg #%d (type=%s): %s",
                                 msg_count,
                                 type(msg).__name__,
@@ -914,6 +919,17 @@ async def run_polymarket_ws(token_ids: list[str]) -> None:
                                 new_set = set(fresh_ids)
                                 added = new_set - prev_set
                                 removed = prev_set - new_set
+
+                                if not added and not removed:
+                                    # Token list unchanged — reset timer, stay connected
+                                    logger.info(
+                                        "[polymarket.stream] Re-subscribe check: "
+                                        "token list unchanged (%d tokens). Staying connected.",
+                                        len(active_token_ids),
+                                    )
+                                    connection_start = time.monotonic()
+                                    continue
+
                                 active_token_ids = fresh_ids
                                 await _refresh_token_event_map()
                                 logger.info(
@@ -928,6 +944,8 @@ async def run_polymarket_ws(token_ids: list[str]) -> None:
                                     "— keeping current %d tokens.",
                                     len(active_token_ids),
                                 )
+                                connection_start = time.monotonic()
+                                continue
                             # Break to reconnect with updated token list
                             break
 
