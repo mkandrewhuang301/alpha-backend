@@ -20,3 +20,12 @@ ENVIRONMENT = os.getenv("ENVIRONMENT", "development")
 # Development sandbox mode — restricts ingestion and WebSocket to a small
 # subset of markets to stay within free-tier Redis Cloud ops/sec limits.
 DEV_MODE = os.getenv("DEV_MODE", "false").lower() in ("true", "1", "yes")
+
+# Supabase — used for Auth JWT verification and user management
+SUPABASE_URL = os.getenv("SUPABASE_URL", "")
+SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY", "")
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
+
+# Optional: Supabase JWT secret for HS256 fallback (older Supabase projects).
+# If not set, only RS256/JWKS verification is used.
+SUPABASE_JWT_SECRET = os.getenv("SUPABASE_JWT_SECRET", "")
