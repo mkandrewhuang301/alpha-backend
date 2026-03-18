@@ -21,10 +21,15 @@ ENVIRONMENT = os.getenv("ENVIRONMENT", "development")
 # subset of markets to stay within free-tier Redis Cloud ops/sec limits.
 DEV_MODE = os.getenv("DEV_MODE", "false").lower() in ("true", "1", "yes")
 
-# Magic Link — for verifying DID tokens sent from the iOS app
+# Magic Link — kept for reference, replaced by Privy
 MAGIC_SECRET_KEY = os.getenv("MAGIC_SECRET_KEY", "")
 
-# Polygon RPC — for Safe deployment, token approvals, balance reads
+# Privy — for verifying auth tokens sent from the iOS app
+PRIVY_APP_ID = os.getenv("PRIVY_APP_ID", "").strip()
+PRIVY_APP_SECRET = os.getenv("PRIVY_APP_SECRET", "").strip()
+PRIVY_VERIFICATION_KEY = os.getenv("PRIVY_VERIFICATION_KEY", "").strip().replace("\\n", "\n")
+
+# Polygon RPC — for token approvals, balance reads
 POLYGON_RPC_URL = os.getenv("POLYGON_RPC_URL", "")
 
 # Polymarket — CLOB API credentials (for reading markets + submitting orders)

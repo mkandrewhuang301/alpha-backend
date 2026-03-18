@@ -10,7 +10,8 @@ greenlet==3.1.1
 h11==0.16.0
 httpx==0.28.1
 kalshi-python-async==3.2.0
-magic-admin>=2.0.0
+PyJWT>=2.8.0
+# magic-admin>=2.0.0  # replaced by Privy
 psycopg2-binary>=2.9.0
 py-clob-client>=0.14.0
 pycparser==3.0
