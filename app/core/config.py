@@ -30,9 +30,6 @@ SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
 # If not set, only RS256/JWKS verification is used.
 SUPABASE_JWT_SECRET = os.getenv("SUPABASE_JWT_SECRET", "")
 
-# Magic Link — kept for reference, replaced by Privy
-MAGIC_SECRET_KEY = os.getenv("MAGIC_SECRET_KEY", "")
-
 # Privy — for verifying auth tokens sent from the iOS app
 PRIVY_APP_ID = os.getenv("PRIVY_APP_ID", "").strip()
 PRIVY_APP_SECRET = os.getenv("PRIVY_APP_SECRET", "").strip()
