@@ -40,3 +40,10 @@ POLYMARKET_RELAYER_ADDRESS = os.getenv("POLYMARKET_RELAYER_ADDRESS", "")
 # Polymarket — builder credentials (for order attribution + fee sharing)
 POLYMARKET_BUILDER_KEY = os.getenv("POLYMARKET_BUILDER_KEY", "")
 POLYMARKET_BUILDER_ADDRESS = os.getenv("POLYMARKET_BUILDER_ADDRESS", "")
+
+# Polymarket — CLOB API host
+CLOB_HOST = os.getenv("CLOB_HOST", "https://clob.polymarket.com")
+
+# Encryption key for storing user CLOB credentials in DB (Fernet 32-byte URL-safe base64)
+# Generate with: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY", "")

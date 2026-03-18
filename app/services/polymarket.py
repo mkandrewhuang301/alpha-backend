@@ -4,7 +4,7 @@ Polymarket service layer.
 Handles:
   - Wallet address derivation (proxy + safe) using CREATE2 math
   - Safe deployment via Polymarket relayer
-  - CLOB API credential management (planned)
+  - CLOB API credential management
   - Order signing and submission (planned)
 """
 
@@ -22,6 +22,8 @@ from web3 import Web3
 from eth_abi import encode
 from eth_abi.packed import encode_packed
 
+from cryptography.fernet import Fernet
+
 from app.core.config import (
     POLYMARKET_RELAYER_URL,
     POLYMARKET_RELAYER_KEY,
@@ -29,6 +31,8 @@ from app.core.config import (
     POLYMARKET_API_KEY,
     POLYMARKET_API_SECRET,
     POLYMARKET_API_PASSPHRASE,
+    CLOB_HOST,
+    ENCRYPTION_KEY,
 )
 
 logger = logging.getLogger(__name__)
@@ -242,6 +246,7 @@ async def deploy_safe(eoa_address: str, signature: str) -> SafeDeployResult:
             timeout=15.0,
         )
         hdrs = _builder_headers("POST", "/submit", body_str)
+        '''
         logger.info("=== RELAYER SUBMIT REQUEST ===")
         logger.info("Headers: %s", hdrs)
         logger.info("URL: %s/submit", POLYMARKET_RELAYER_URL)
@@ -249,6 +254,7 @@ async def deploy_safe(eoa_address: str, signature: str) -> SafeDeployResult:
         logger.info("=== RELAYER SUBMIT RESPONSE ===")
         logger.info("Status: %s", resp.status_code)
         logger.info("Body: %s", resp.text)
+        '''
         resp.raise_for_status()
         submit_data = resp.json()
         transaction_id = submit_data["transactionID"]
@@ -284,3 +290,110 @@ async def deploy_safe(eoa_address: str, signature: str) -> SafeDeployResult:
                 raise ValueError(f"Safe deployment failed: state={state}, error={error_msg}")
 
     raise TimeoutError("Safe deployment timed out after 2 minutes")
+
+
+# ---------------------------------------------------------------------------
+# CLOB API credential derivation
+# ---------------------------------------------------------------------------
+
+CLOB_AUTH_MESSAGE = "This message attests that I control the given wallet"
+
+
+@dataclass
+class ClobSigningMessage:
+    """
+    The EIP-712 ClobAuth message iOS needs to sign to derive CLOB API credentials.
+
+    EIP-712 domain: { name: "ClobAuthDomain", version: "1", chainId: 137 }
+    EIP-712 type:   ClobAuth { address: address, timestamp: string, nonce: uint256, message: string }
+    """
+    address: str
+    timestamp: str
+    nonce: int
+    message: str
+
+
+@dataclass
+class ClobCredentials:
+    api_key: str
+    api_secret: str
+    passphrase: str
+
+
+def get_clob_signing_message(eoa_address: str) -> ClobSigningMessage:
+    """
+    Build the EIP-712 ClobAuth payload iOS needs to sign.
+
+    iOS signs this with eth_signTypedData_v4, then calls POST /users/clob/credentials
+    with the resulting signature + timestamp + nonce.
+    """
+    return ClobSigningMessage(
+        address=Web3.to_checksum_address(eoa_address),
+        timestamp=str(int(time.time())),
+        nonce=0,
+        message=CLOB_AUTH_MESSAGE,
+    )
+
+
+async def derive_clob_credentials(
+    eoa_address: str,
+    signature: str,
+    timestamp: str,
+    nonce: int = 0,
+) -> ClobCredentials:
+    """
+    Derive Polymarket CLOB API credentials from a signed ClobAuth EIP-712 message.
+
+    Sends Level 1 headers (POLY_ADDRESS/SIGNATURE/TIMESTAMP/NONCE) to the CLOB API.
+    Tries GET /auth/derive-api-key first (returns existing key if present),
+    falls back to POST /auth/api-key (creates a new key).
+
+    Args:
+        eoa_address: User's EOA address
+        signature:   EIP-712 ClobAuth signature from iOS Magic signing
+        timestamp:   Unix timestamp string (seconds) used when signing
+        nonce:       Nonce used when signing (always 0 for first-time derivation)
+
+    Returns:
+        ClobCredentials with api_key, api_secret, passphrase
+    """
+    headers = {
+        "POLY_ADDRESS": Web3.to_checksum_address(eoa_address),
+        "POLY_SIGNATURE": signature,
+        "POLY_TIMESTAMP": timestamp,
+        "POLY_NONCE": str(nonce),
+    }
+
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(
+            f"{CLOB_HOST}/auth/derive-api-key",
+            headers=headers,
+            timeout=15.0,
+        )
+        if resp.status_code != 200:
+            logger.info("derive-api-key returned %s, trying POST /auth/api-key", resp.status_code)
+            resp = await client.post(
+                f"{CLOB_HOST}/auth/api-key",
+                headers=headers,
+                timeout=15.0,
+            )
+            resp.raise_for_status()
+
+        data = resp.json()
+        logger.info("CLOB credential response: %s", data)
+
+    return ClobCredentials(
+        api_key=data["apiKey"],
+        api_secret=data["secret"],
+        passphrase=data["passphrase"],
+    )
+
+
+def encrypt_credential(value: str) -> str:
+    """Encrypt a CLOB credential value with Fernet symmetric encryption."""
+    return Fernet(ENCRYPTION_KEY.encode()).encrypt(value.encode()).decode()
+
+
+def decrypt_credential(encrypted: str) -> str:
+    """Decrypt a Fernet-encrypted CLOB credential value."""
+    return Fernet(ENCRYPTION_KEY.encode()).decrypt(encrypted.encode()).decode()
