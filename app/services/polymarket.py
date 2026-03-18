@@ -246,6 +246,7 @@ async def deploy_safe(eoa_address: str, signature: str) -> SafeDeployResult:
             timeout=15.0,
         )
         hdrs = _builder_headers("POST", "/submit", body_str)
+        '''
         logger.info("=== RELAYER SUBMIT REQUEST ===")
         logger.info("Headers: %s", hdrs)
         logger.info("URL: %s/submit", POLYMARKET_RELAYER_URL)
@@ -253,6 +254,7 @@ async def deploy_safe(eoa_address: str, signature: str) -> SafeDeployResult:
         logger.info("=== RELAYER SUBMIT RESPONSE ===")
         logger.info("Status: %s", resp.status_code)
         logger.info("Body: %s", resp.text)
+        '''
         resp.raise_for_status()
         submit_data = resp.json()
         transaction_id = submit_data["transactionID"]
