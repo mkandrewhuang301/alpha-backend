@@ -397,3 +397,67 @@ def encrypt_credential(value: str) -> str:
 def decrypt_credential(encrypted: str) -> str:
     """Decrypt a Fernet-encrypted CLOB credential value."""
     return Fernet(ENCRYPTION_KEY.encode()).decrypt(encrypted.encode()).decode()
+
+
+# ---------------------------------------------------------------------------
+# User-level CLOB L2 authentication
+# ---------------------------------------------------------------------------
+
+def build_user_clob_headers(
+    method: str,
+    path: str,
+    api_key: str,
+    secret: str,
+    passphrase: str,
+    eoa_address: str,
+    body: str = "",
+) -> dict:
+    """
+    Build the 5 POLY_* headers required for L2-authenticated CLOB requests.
+
+    Uses the user's stored CLOB credentials (api_key, secret, passphrase)
+    derived from their EOA via EIP-712 ClobAuth signing.
+
+    Timestamp is UNIX seconds (not milliseconds — different from builder headers).
+    """
+    timestamp = str(int(time.time()))
+    sig = _build_hmac_signature(secret, timestamp, method, path, body)
+    return {
+        "POLY_ADDRESS": Web3.to_checksum_address(eoa_address),
+        "POLY_API_KEY": api_key,
+        "POLY_PASSPHRASE": passphrase,
+        "POLY_TIMESTAMP": timestamp,
+        "POLY_SIGNATURE": sig,
+        "Content-Type": "application/json",
+    }
+
+
+async def get_user_clob_credentials(eoa_address: str, db) -> ClobCredentials:
+    """
+    Load and decrypt a user's CLOB credentials from the DB.
+
+    Args:
+        eoa_address: User's EOA wallet address
+        db:          AsyncSession from FastAPI dependency
+
+    Raises:
+        ValueError: If no account or credentials found for this EOA
+    """
+    from sqlalchemy import select
+    from app.models.db import User, Account
+
+    result = await db.execute(
+        select(Account).join(User).where(
+            User.eoa_address == eoa_address,
+            Account.exchange == "polymarket",
+        )
+    )
+    account = result.scalar_one_or_none()
+    if not account or not account.encrypted_api_key:
+        raise ValueError(f"No CLOB credentials found for {eoa_address} — call POST /users/clob/credentials first")
+
+    return ClobCredentials(
+        api_key=decrypt_credential(account.encrypted_api_key),
+        api_secret=decrypt_credential(account.encrypted_api_secret),
+        passphrase=decrypt_credential(account.encrypted_passphrase),
+    )
