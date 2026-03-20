@@ -145,88 +145,6 @@ def _infer_market_type(outcomes: list[str]) -> str:
     return "categorical"
 
 
-def _infer_series_format_type(series_dict: dict) -> str:
-    """
-    Heuristically classify a series' dominant market format.
-
-    Returns one of: 'binary', 'categorical', 'scalar'
-
-    Used only for DEV_MODE diversity selection — not stored in DB.
-
-    Rules (in priority order):
-      negRisk=true    → categorical  (Polymarket grouped mutual-exclusion markets)
-      slug/title has price/range keywords → scalar  (crypto price ladders, score ranges)
-      culture/award/nba/nfl in category   → categorical  (who wins the trophy/award)
-      default                             → binary  (yes/no question)
-    """
-    if series_dict.get("negRisk") or series_dict.get("neg_risk"):
-        return "categorical"
-
-    slug = (series_dict.get("slug") or "").lower()
-    title = (series_dict.get("title") or "").lower()
-
-    scalar_keywords = ("price", "hit", "reach", "above", "below", "range", "level", "high", "low")
-    if any(kw in slug or kw in title for kw in scalar_keywords):
-        return "scalar"
-
-    cats_lower = [c.lower() for c in _extract_category_labels(series_dict)]
-    categorical_cat_hints = {"culture", "entertainment", "music", "tv", "film", "award", "nba", "nfl", "sports"}
-    if any(any(h in cat for h in categorical_cat_hints) for cat in cats_lower):
-        return "categorical"
-
-    return "binary"
-
-
-def _select_diverse_series(
-    series_page: list[dict],
-    max_total: int = 20,
-    max_per_bucket: int = 2,
-) -> list[dict]:
-    """
-    Select a diverse subset of series across categories and market format types.
-
-    Groups series into (primary_category_slug, format_type) buckets, then does
-    max_per_bucket rounds of round-robin selection across all buckets — picking
-    one from each bucket per round — until max_total series are collected.
-
-    This guarantees representation across both category and format dimensions
-    without over-indexing on any single bucket.
-    """
-    from collections import defaultdict
-
-    buckets: dict[tuple[str, str], list[dict]] = defaultdict(list)
-    for s in series_page:
-        cats = _extract_category_labels(s)
-        primary_cat = slugify(cats[0]) if cats else "other"
-        fmt = _infer_series_format_type(s)
-        buckets[(primary_cat, fmt)].append(s)
-
-    # Sort within each bucket by 24h volume descending so round-robin always
-    # picks the highest-volume series per (category, format) slot first.
-    for bk in buckets:
-        buckets[bk].sort(
-            key=lambda s: float(s.get("volume24hr") or s.get("volume") or 0),
-            reverse=True,
-        )
-
-    selected: list[dict] = []
-    bucket_counters: dict[tuple[str, str], int] = defaultdict(int)
-    # Sort buckets for deterministic ordering (category asc, then format asc)
-    bucket_keys = sorted(buckets.keys())
-
-    for _round in range(max_per_bucket):
-        for bk in bucket_keys:
-            idx = bucket_counters[bk]
-            items = buckets[bk]
-            if idx < len(items):
-                selected.append(items[idx])
-                bucket_counters[bk] += 1
-                if len(selected) >= max_total:
-                    return selected
-
-    return selected
-
-
 def _infer_side(outcome_label: str) -> str:
     """Map outcome label to trade_side enum value."""
     label = outcome_label.lower().strip()
@@ -762,11 +680,10 @@ async def _fetch_all_tags(page_size: int = 100) -> list[dict]:
 async def _fetch_tag_children(tag_id: str) -> list[dict]:
     """
     Fetch child tags for a given parent tag ID from GET /tags/{id}/related-tags/tags.
-    Retries up to 6 times with exponential backoff on HTTP 429 (rate-limited).
-    Backoff sequence: 4s → 8s → 16s → 32s → 64s (capped at 60s).
+    Retries up to 3 times with exponential backoff on HTTP 429 (rate-limited).
     """
-    backoff = 5.0
-    max_retries = 6
+    backoff = 2.0
+    max_retries = 3
     for attempt in range(max_retries):
         try:
             async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as client:
@@ -778,12 +695,7 @@ async def _fetch_tag_children(tag_id: str) -> list[dict]:
                     return data if isinstance(data, list) else []
                 elif resp.status_code == 429:
                     if attempt < max_retries - 1:
-                        wait = min(backoff, 60.0)
-                        logger.warning(
-                            "[polymarket.ingest] 429 for tag_id=%s attempt=%d/%d — waiting %.0fs",
-                            tag_id, attempt + 1, max_retries, wait,
-                        )
-                        await asyncio.sleep(wait)
+                        await asyncio.sleep(backoff)
                         backoff *= 2.0
                     # else fall through to final return below
                 else:
@@ -1130,9 +1042,7 @@ async def load_polymarket_token_ids_from_db() -> list[str]:
                 SELECT DISTINCT mo.execution_asset_id
                 FROM market_outcomes mo
                 JOIN markets m ON mo.market_id = m.id
-                WHERE m.exchange = 'polymarket'
-                  AND m.is_deleted = FALSE
-                  AND m.status NOT IN ('resolved', 'canceled')
+                WHERE m.exchange = 'polymarket' AND m.is_deleted = FALSE
                 ORDER BY mo.execution_asset_id
                 """,
             )
@@ -1173,27 +1083,18 @@ async def build_token_event_map() -> dict[str, str]:
 
 async def run_polymarket_state_reconciliation() -> dict:
     """
-    Delta sync: check Polymarket markets for status/resolution changes AND refresh volume.
+    Delta sync: check Polymarket markets for status/resolution changes.
 
-    Queries the Gamma API for all active markets and:
-      1. Updates status/result in DB for resolved/closed markets.
-      2. Refreshes volume_24h in DB (markets table) from Gamma API market.volume24hr.
-      3. Writes volume_24h to Redis HSET for each token so the frontend sees live volume.
-      4. Updates events_trending_24h_polymarket ZSET (summed per event for trending endpoint).
+    Queries the Gamma API for recently closed/resolved markets and updates
+    their status and result in the DB. Intended as a periodic arq cron job
+    (every 5 minutes in production).
 
-    The CLOB WebSocket does NOT transmit volume — this cron is the authoritative
-    source of volume data for Redis. Runs every 2 min (DEV) / 2 min (prod).
-
-    Returns a stats dict: {"checked": N, "updated": N, "volume_refreshed": N}.
+    Returns a stats dict: {"checked": N, "updated": N}.
     """
     logger.info("[polymarket.ingest] Starting state reconciliation...")
     pool = await get_asyncpg_pool()
-    from app.core.redis import get_redis
-    from app.core.market_cache import _make_key
-    redis_conn = await get_redis()
     checked = 0
     updated = 0
-    volume_refreshed = 0
 
     try:
         # Pull all non-resolved polymarket markets from our DB
@@ -1222,12 +1123,6 @@ async def run_polymarket_state_reconciliation() -> dict:
 
         batch_size = 20
         updates: list[tuple] = []  # (condition_id, new_status, result)
-        # Volume data collected from Gamma API response for Redis + DB refresh
-        # Maps condition_id → (volume_24h_float, [token_id, ...])
-        volume_data: dict[str, tuple[float, list[str]]] = {}
-        # event_ext_id → summed volume (for trending ZSET)
-        event_volumes: dict[str, float] = {}
-        event_ext_id_map = {r["ext_id"]: r["event_ext_id"] for r in rows}
 
         async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as client:
             for i in range(0, len(condition_ids), batch_size):
@@ -1278,35 +1173,13 @@ async def run_polymarket_state_reconciliation() -> dict:
                         if new_status != db_status_map.get(condition_id):
                             updates.append((condition_id, new_status, winning_outcome))
 
-                        # --- Volume refresh ---
-                        # Gamma API provides volume24hr (rolling 24h) and volume (total).
-                        # We use volume24hr as the primary display metric.
-                        vol24 = float(mkt.get("volume24hr") or mkt.get("volume") or 0)
-                        token_ids_raw = (
-                            mkt.get("clobTokenIds") or mkt.get("clob_token_ids") or []
-                        )
-                        if isinstance(token_ids_raw, str):
-                            try:
-                                token_ids_raw = _json.loads(token_ids_raw)
-                            except Exception:
-                                token_ids_raw = []
-                        token_ids_list = [str(t) for t in token_ids_raw if t]
-                        volume_data[condition_id] = (vol24, token_ids_list)
-
-                        # Accumulate event-level volume for trending ZSET
-                        event_ext_id = event_ext_id_map.get(condition_id)
-                        if event_ext_id and vol24 > 0:
-                            event_volumes[event_ext_id] = (
-                                event_volumes.get(event_ext_id, 0.0) + vol24
-                            )
-
                 except Exception as exc:
                     logger.warning(
                         "[polymarket.ingest] Batch reconciliation error: %s", exc
                     )
                     continue
 
-        # Apply status/resolution updates to DB
+        # Apply updates
         if updates:
             now = datetime.now(timezone.utc)
             async with pool.acquire() as conn:
@@ -1410,7 +1283,7 @@ async def run_polymarket_state_reconciliation() -> dict:
     except Exception as exc:
         logger.error("[polymarket.ingest] State reconciliation failed: %s", exc, exc_info=True)
 
-    return {"checked": checked, "updated": updated, "volume_refreshed": volume_refreshed}
+    return {"checked": checked, "updated": updated}
 
 
 # ---------------------------------------------------------------------------
@@ -1419,90 +1292,59 @@ async def run_polymarket_state_reconciliation() -> dict:
 
 async def run_polymarket_dev_sync() -> list[str]:
     """
-    Sync a diverse set of active Polymarket series for DEV_MODE.
+    Sync the curated Polymarket DEV_MODE series targets from the Gamma API.
 
-    Rather than hardcoded slugs (which go stale), fetches a large page of
-    currently-active series from the Gamma API and selects a diverse subset
-    across categories and market format types (binary / categorical / scalar).
-
-    Selection budget: up to 20 series, at most 2 per (category, format) bucket,
-    round-robined so every represented category gets a slot before any repeats.
-
-    Falls back to existing DB token IDs if the sync yields 0 tokens (e.g. all
-    active events for the selected series have since resolved between restarts).
+    For each slug in POLYMARKET_DEV_SERIES_SLUGS:
+        1. Fetch series from Gamma /series?slug={slug}
+        2. Upsert series (id as ext_id, slug in platform_metadata, categories as JSONB list)
+        3. Upsert events (id as ext_id, slug in platform_metadata)
+        4. Upsert markets + outcomes (conditionId as ext_id, zip outcomes ↔ clobTokenIds)
 
     Populates POLYMARKET_DEV_TOKEN_IDS and POLYMARKET_DEV_EVENT_IDS.
     Returns the list of token IDs for WebSocket subscription.
     """
     from app.core.dev_config import (
+        POLYMARKET_DEV_SERIES_SLUGS,
         POLYMARKET_DEV_TOKEN_IDS,
         POLYMARKET_DEV_EVENT_IDS,
     )
 
-    _DEV_CANDIDATE_POOL = 200   # How many active series to fetch for selection
-    _DEV_SERIES_TARGET  = 20    # Max series to process
-    _DEV_PER_BUCKET     = 2     # Max series per (category, format) bucket
-
     logger.info(
-        "[polymarket.ingest] Starting DEV sync — fetching %d active series for diverse selection",
-        _DEV_CANDIDATE_POOL,
+        "[polymarket.ingest] Starting DEV sync for %d target series",
+        len(POLYMARKET_DEV_SERIES_SLUGS),
     )
     pool = await get_asyncpg_pool()
 
-    # 1. Fetch candidate pool of active series
-    series_page = await _fetch_active_series(limit=_DEV_CANDIDATE_POOL, offset=0)
-    if not series_page:
-        logger.warning("[polymarket.ingest] Gamma API returned no active series — aborting DEV sync")
-        return await load_polymarket_token_ids_from_db()
-
-    # 2. Sort candidate pool by 24h volume descending before diversity selection.
-    # This ensures that within each (category, format) bucket, the highest-volume
-    # series are at the front and get picked first during round-robin.
-    series_page.sort(
-        key=lambda s: float(s.get("volume24hr") or s.get("volume") or 0),
-        reverse=True,
-    )
-
-    # 3. Select a diverse subset across (category, format_type) buckets
-    selected = _select_diverse_series(
-        series_page,
-        max_total=_DEV_SERIES_TARGET,
-        max_per_bucket=_DEV_PER_BUCKET,
-    )
-    logger.info(
-        "[polymarket.ingest] DEV sync: selected %d/%d series (diverse by category × format type)",
-        len(selected), len(series_page),
-    )
-    for s in selected:
-        cats = _extract_category_labels(s)
-        fmt = _infer_series_format_type(s)
-        vol = float(s.get("volume24hr") or s.get("volume") or 0)
-        logger.info(
-            "[polymarket.ingest]   → slug=%-40s  category=%-20s  format=%-12s  vol24h=$%.0f",
-            s.get("slug", ""), (cats[0] if cats else "?"), fmt, vol,
-        )
-
-    # 4. Upsert each selected series + its events/markets/outcomes
     all_token_ids: list[str] = []
     all_event_ids: list[str] = []
 
-    for series_dict in selected:
-        try:
-            token_ids = await _process_series(pool, series_dict)
-            all_token_ids.extend(token_ids)
-            for event_dict in (series_dict.get("events") or []):
-                eid = str(event_dict.get("id", "")).strip()
-                if eid:
-                    all_event_ids.append(eid)
-        except Exception as exc:
-            logger.error(
-                "[polymarket.ingest] Error processing series id=%s slug=%s: %s",
-                series_dict.get("id"), series_dict.get("slug"), exc, exc_info=True,
-            )
+    for slug in POLYMARKET_DEV_SERIES_SLUGS:
+        series_list = await _fetch_series_by_slug(slug)
 
-    # 5. Populate mutable dev config lists (dedup, preserve order)
+        if not series_list:
+            logger.warning("[polymarket.ingest] No series found for slug=%s — skipping", slug)
+            continue
+
+        for series_dict in series_list:
+            try:
+                token_ids = await _process_series(pool, series_dict)
+                all_token_ids.extend(token_ids)
+                await asyncio.sleep(0)  # yield to event loop between series
+
+                # Collect event ext_ids from events nested in this series
+                for event_dict in (series_dict.get("events") or []):
+                    eid = str(event_dict.get("id", "")).strip()
+                    if eid:
+                        all_event_ids.append(eid)
+            except Exception as exc:
+                logger.error(
+                    "[polymarket.ingest] Error processing series slug=%s: %s",
+                    slug, exc, exc_info=True,
+                )
+
+    # Update mutable dev config lists
     POLYMARKET_DEV_TOKEN_IDS.clear()
-    POLYMARKET_DEV_TOKEN_IDS.extend(list(dict.fromkeys(all_token_ids)))
+    POLYMARKET_DEV_TOKEN_IDS.extend(list(dict.fromkeys(all_token_ids)))  # dedup + preserve order
 
     POLYMARKET_DEV_EVENT_IDS.clear()
     POLYMARKET_DEV_EVENT_IDS.extend(list(dict.fromkeys(all_event_ids)))
