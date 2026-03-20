@@ -326,6 +326,10 @@ def upgrade() -> None:
             sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.text("NOW()")),
             sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.text("NOW()")),
         )
+    if not _col_exists(insp, "users", "eoa_address"):
+        op.add_column("users", sa.Column("eoa_address", sa.Text(), unique=True, nullable=True))
+    if not _col_exists(insp, "users", "privy_did"):
+        op.add_column("users", sa.Column("privy_did", sa.Text(), unique=True, nullable=True))
 
     # -------------------------------------------------------------- accounts
     if not _table_exists(insp, "accounts"):

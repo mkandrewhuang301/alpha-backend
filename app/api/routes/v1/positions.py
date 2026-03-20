@@ -15,6 +15,7 @@ import logging
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.auth import get_authenticated_eoa
 from app.core.database import get_db
 from app.services.positions import get_positions, get_open_orders, get_trades
 
@@ -24,12 +25,14 @@ router = APIRouter()
 
 
 @router.get("/users/positions")
-async def user_positions(eoa_address: str):
+async def user_positions(
+    eoa_address: str = Depends(get_authenticated_eoa),
+    db: AsyncSession = Depends(get_db),
+):
     """
     Fetch the user's open positions on Polymarket.
 
-    Uses the public Polymarket Data API — no CLOB credentials required.
-    Returns position objects (conditionId, size, currentValue, etc.)
+    Requires: Authorization: Bearer <privy_access_token>
     """
     try:
         return await get_positions(eoa_address)
@@ -40,39 +43,39 @@ async def user_positions(eoa_address: str):
 
 @router.get("/users/orders")
 async def user_orders(
-    eoa_address: str,
+    eoa_address: str = Depends(get_authenticated_eoa),
     db: AsyncSession = Depends(get_db),
 ):
     """
     Fetch the user's open orders on Polymarket.
 
-    Returns orders with status 'live' — orders that haven't been filled or cancelled.
+    Requires: Authorization: Bearer <privy_access_token>
     """
     try:
         return await get_open_orders(eoa_address, db)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
-        logger.error("Failed to fetch orders for %s: %s", eoa_address, e)
+        logger.error("Failed to fetch orders for %s: %s", eoa_address, e, exc_info=True)
         raise HTTPException(status_code=502, detail="Failed to fetch orders from Polymarket")
 
 
 @router.get("/users/trades")
 async def user_trades(
-    eoa_address: str,
     market: str | None = None,
+    eoa_address: str = Depends(get_authenticated_eoa),
     db: AsyncSession = Depends(get_db),
 ):
     """
     Fetch the user's trade history on Polymarket.
 
-    Optional query param:
-        market — conditionId to filter trades for a specific market
+    Requires: Authorization: Bearer <privy_access_token>
+    Optional query param: market — conditionId to filter by market
     """
     try:
         return await get_trades(eoa_address, db, market=market)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
-        logger.error("Failed to fetch trades for %s: %s", eoa_address, e)
+        logger.error("Failed to fetch trades for %s: %s", eoa_address, e, exc_info=True)
         raise HTTPException(status_code=502, detail="Failed to fetch trades from Polymarket")

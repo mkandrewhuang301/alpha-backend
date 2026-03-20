@@ -6,12 +6,13 @@ All functions decrypt the user's stored credentials and sign the request before 
 """
 
 import logging
+import time
 
 import httpx
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import CLOB_HOST
-from app.services.polymarket import build_user_clob_headers, get_user_clob_credentials
+from app.services.polymarket import build_user_clob_headers, get_user_clob_credentials, derive_proxy_wallet
 
 logger = logging.getLogger(__name__)
 
@@ -28,10 +29,11 @@ async def get_positions(eoa_address: str) -> list[dict]:
 
     Returns a list of position objects (conditionId, size, currentValue, etc.)
     """
+    proxy_wallet = derive_proxy_wallet(eoa_address)
     async with httpx.AsyncClient() as client:
         resp = await client.get(
             f"{POLYMARKET_DATA_API}/positions",
-            params={"user": eoa_address},
+            params={"user": proxy_wallet},
             timeout=15.0,
         )
         resp.raise_for_status()
@@ -44,7 +46,9 @@ async def get_open_orders(eoa_address: str, db: AsyncSession) -> list[dict]:
 
     Returns orders that haven't been fully filled or cancelled.
     """
+    t0 = time.time()
     creds = await get_user_clob_credentials(eoa_address, db)
+    logger.info("get_open_orders: creds loaded in %.2fs", time.time() - t0)
     headers = build_user_clob_headers(
         method="GET",
         path="/data/orders",
@@ -53,8 +57,10 @@ async def get_open_orders(eoa_address: str, db: AsyncSession) -> list[dict]:
         passphrase=creds.passphrase,
         eoa_address=eoa_address,
     )
+    logger.info("get_open_orders: headers built, calling CLOB...")
     async with httpx.AsyncClient() as client:
-        resp = await client.get(f"{CLOB_HOST}/data/orders", headers=headers, timeout=15.0)
+        resp = await client.get(f"{CLOB_HOST}/data/orders", headers=headers, timeout=30.0)
+        logger.info("get_open_orders: CLOB responded %s in %.2fs", resp.status_code, time.time() - t0)
         resp.raise_for_status()
         return resp.json()
 
@@ -82,6 +88,6 @@ async def get_trades(eoa_address: str, db: AsyncSession, market: str | None = No
         params["market"] = market
 
     async with httpx.AsyncClient() as client:
-        resp = await client.get(f"{CLOB_HOST}/data/trades", headers=headers, params=params, timeout=15.0)
+        resp = await client.get(f"{CLOB_HOST}/data/trades", headers=headers, params=params, timeout=30.0)
         resp.raise_for_status()
         return resp.json()

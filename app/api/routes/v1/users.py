@@ -113,6 +113,10 @@ async def register(
     existing_user = result.scalar_one_or_none()
 
     if existing_user:
+        # Backfill privy_did if missing (users registered before this column existed)
+        if not existing_user.privy_did:
+            existing_user.privy_did = privy_did
+            await db.commit()
         logger.info("Returning user login: eoa=%s", eoa_address)
         return RegisterResponse(
             user_id=existing_user.id,
@@ -126,6 +130,7 @@ async def register(
     new_user = User(
         email=email,
         eoa_address=eoa_address,
+        privy_did=privy_did,
     )
     db.add(new_user)
     await db.flush()

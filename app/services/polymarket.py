@@ -422,14 +422,16 @@ def build_user_clob_headers(
     """
     timestamp = str(int(time.time()))
     sig = _build_hmac_signature(secret, timestamp, method, path, body)
-    return {
+    headers = {
         "POLY_ADDRESS": Web3.to_checksum_address(eoa_address),
         "POLY_API_KEY": api_key,
         "POLY_PASSPHRASE": passphrase,
         "POLY_TIMESTAMP": timestamp,
         "POLY_SIGNATURE": sig,
-        "Content-Type": "application/json",
     }
+    if method.upper() in ("POST", "DELETE", "PUT", "PATCH"):
+        headers["Content-Type"] = "application/json"
+    return headers
 
 
 async def get_user_clob_credentials(eoa_address: str, db) -> ClobCredentials:
