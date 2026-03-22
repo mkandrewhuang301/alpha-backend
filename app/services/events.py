@@ -14,7 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload, joinedload
 
 from app.core.market_cache import MarketCacheManager
-from app.models.db import Event, Market, Series
+from app.models.db import Event, Market, MarketOutcome, Series
 
 
 def _build_redis_asset_id(exchange: str, market_ext_id: str, execution_asset_id: str) -> str:
@@ -100,10 +100,11 @@ async def list_events_feed(
     if not events:
         return [], 0
 
-    # Find lead market (first market) per event for yes/no prices
+    # Find lead market (first market) per event with outcomes for yes/no prices
     event_ids = [e.id for e in events]
     market_stmt = (
         select(Market)
+        .options(selectinload(Market.outcomes))
         .where(Market.event_id.in_(event_ids), Market.is_deleted == False)
         .order_by(Market.created_at.asc())
     )
@@ -115,14 +116,26 @@ async def list_events_feed(
         if m.event_id not in lead_market:
             lead_market[m.event_id] = m
 
-    # Batch-fetch Redis prices for lead markets
+    # Batch-fetch Redis prices for lead markets.
+    # Kalshi: outcomes are "yes"/"no" strings → key = "{ticker}-yes"/"{ticker}-no"
+    # Polymarket: outcomes are ERC-1155 token IDs → key = "{token_id}"
     redis_asset_ids: list[str] = []
-    event_to_asset: dict[UUID, tuple[str, str]] = {}
+    event_to_asset: dict[UUID, tuple[str, str]] = {}  # event_id → (yes_redis_id, no_redis_id)
     for eid, mkt in lead_market.items():
-        yes_id = _build_redis_asset_id(exchange, mkt.ext_id, "yes")
-        no_id = _build_redis_asset_id(exchange, mkt.ext_id, "no")
-        redis_asset_ids.extend([yes_id, no_id])
-        event_to_asset[eid] = (yes_id, no_id)
+        yes_asset_id: Optional[str] = None
+        no_asset_id: Optional[str] = None
+        for outcome in mkt.outcomes:
+            side = outcome.side.lower() if outcome.side else ""
+            asset_id = _build_redis_asset_id(exchange, mkt.ext_id, outcome.execution_asset_id)
+            if side == "yes" and yes_asset_id is None:
+                yes_asset_id = asset_id
+            elif side == "no" and no_asset_id is None:
+                no_asset_id = asset_id
+        if yes_asset_id:
+            redis_asset_ids.append(yes_asset_id)
+        if no_asset_id:
+            redis_asset_ids.append(no_asset_id)
+        event_to_asset[eid] = (yes_asset_id or "", no_asset_id or "")
 
     ticker_data = await cache.get_tickers(exchange, redis_asset_ids)
 

@@ -4,6 +4,26 @@
 
 ---
 
+## gstack
+
+Use the `/browse` skill from gstack for all web browsing. Never use `mcp__claude-in-chrome__*` tools.
+
+If gstack skills aren't working, run `cd ~/.claude/skills/gstack && ./setup` to build the binary and register skills.
+
+### Available skills
+- `/browse` — browse the web with a headless Chromium browser
+- `/plan-ceo-review` — review a plan from a CEO/product perspective
+- `/plan-eng-review` — review a plan from an engineering perspective
+- `/review` — code review
+- `/ship` — ship code (review + merge)
+- `/qa` — QA testing with browser automation
+- `/qa-only` — QA testing only (no code changes)
+- `/setup-browser-cookies` — set up browser cookies for authenticated browsing
+- `/retro` — run a retrospective
+- `/gstack-upgrade` — upgrade gstack to the latest version
+
+---
+
 ## What Is Alpha
 
 Alpha is a consumer iOS prediction market intelligence app for mainstream sports bettors. Think Action Network meets eToro meets Bloomberg Terminal — but for regular people who just want to feel informed enough to trade confidently on Kalshi and Polymarket.
@@ -137,20 +157,33 @@ PostgreSQL + Redis ──► FastAPI routes ──► iOS app
 **Polymarket WebSocket strategy (`workers/polymarket/stream.py`):**
 ```
 Both DEV_MODE and production use the same micro-batching flusher:
-  WS receive loop → _enqueue_ticker(msg) → asyncio.Queue(maxsize=100_000) (non-blocking, drops if full)
+  WS receive loop → _parse_and_enqueue(msg) → asyncio.Queue(maxsize=100_000) (non-blocking, drops if full)
   _redis_flusher() → drain in 100ms/500-item batches → pipeline HSET ticker:polymarket:{token_id}
                    → Phase 2: ZADD events_trending_24h_polymarket (volume from tick data)
-                   → Phase 3: drain _resolution_candidates → asyncio.create_task(_check_and_update_market_resolution())
+                   → Phase 3: drain _ws_resolutions dict → asyncio.create_task(_apply_ws_resolution())
+                   → Phase 4: drain _resolution_candidates → asyncio.create_task(_check_and_update_market_resolution())
 
-Resolution candidate detection:
-  last_trade_price >= 0.99 or <= 0.01 → add token_id to _resolution_candidates set
-  _check_and_update_market_resolution(token_id):
-    → Semaphore(3) — caps concurrent Supabase connections
-    → GET Gamma API /markets?conditionId={id}
-    → if tokens[].winner == true → UPDATE markets SET status='resolved', result={outcome}
+Subscribe message (custom_feature_enabled=true required for market_resolved/new_market/best_bid_ask):
+  {"type": "market", "assets_ids": [token_id, ...], "custom_feature_enabled": true}
 
-Subscribe message:
-  {"type": "market", "assets_ids": [token_id, ...]}  (all synced token IDs)
+Message types handled:
+  book            → _handle_book_message() — bids/asks are {"price": "0.48", "size": "30"} dicts (not tuples)
+  price_change    → _handle_price_change_message() — top-level price_changes array (multi-asset per msg)
+                    each entry has asset_id, best_bid, best_ask directly from exchange
+  best_bid_ask    → _handle_best_bid_ask_message() — authoritative best bid/ask (custom_feature_enabled)
+  last_trade_price → _handle_last_trade_price_message() — last traded price, resolution detection
+  tick_size_change → _handle_tick_size_change_message() — new_tick_size field (not tick_size)
+  market_resolved  → _handle_market_resolved_message() — direct resolution (Path A, no Gamma roundtrip)
+  new_market       → _handle_new_market_message() — logged, picked up by reconciliation cron
+
+Resolution paths (two-tier):
+  Path A (WS market_resolved event — preferred, no Gamma API):
+    winning_asset_id + winning_outcome from WS → _ws_resolutions dict
+    → _apply_ws_resolution(token_id, outcome) → DB lookup → Postgres UPDATE
+  Path B (last_trade_price fallback — Gamma API confirm):
+    last_trade_price >= 0.99 or <= 0.01 → _resolution_candidates set
+    → _check_and_update_market_resolution(token_id) → Gamma API → Postgres UPDATE
+  Both paths: Semaphore(3) — caps concurrent Supabase connections
 ```
 
 **Kalshi WebSocket strategy (`workers/kalshi/stream.py`) — for when it's re-enabled:**
@@ -252,7 +285,7 @@ alpha-backend/
 │   │   │   ├── ingest.py            # Gamma API sync: series/events/markets/outcomes/tags/sports
 │   │   │   │                        # run_polymarket_dev_sync() — startup sync (DEV_MODE)
 │   │   │   │                        # run_polymarket_state_reconciliation() — arq cron (DEV + prod, every 2min)
-│   │   │   │                        # _fetch_tag_children() — exponential backoff on 429 (2s→4s→8s, 3 attempts)
+│   │   │   │                        # _fetch_tag_children() — exponential backoff on 429 (5s→10s→20s→40s→60s→60s, 6 attempts, capped at 60s)
 │   │   │   │                        # _process_series() — caps at 4 events per series in DEV_MODE
 │   │   │   └── stream.py            # CLOB WS: book/price_change → Redis HSET, ZADD trending ZSET
 │   │   │                            # Resolution: last_trade_price >= 0.99|<= 0.01 → Gamma confirm → Postgres UPDATE
@@ -264,7 +297,6 @@ alpha-backend/
 │   └── core/
 │       ├── config.py                # Loads all env variables (including DEV_MODE)
 │       ├── dev_config.py            # DEV_MODE sandbox constants:
-│       │                            #   POLYMARKET_DEV_SERIES_SLUGS (5 curated slugs)
 │       │                            #   DEV_EXPLICIT_SERIES (Kalshi series dict, currently all commented out)
 │       │                            #   DEV_TARGET_SERIES, DEV_TARGET_MARKETS (populated at startup)
 │       │                            #   POLYMARKET_DEV_TOKEN_IDS, POLYMARKET_DEV_EVENT_IDS
@@ -431,17 +463,11 @@ Full SQL schema is in `/schema.sql`. ORM models live in `app/models/db.py`.
 
 **When DEV_MODE=True:**
 - **Kalshi**: All Kalshi sync and WebSocket are disabled. `DEV_EXPLICIT_SERIES` dict is defined but all entries are commented out. `DEV_TARGET_SERIES` and `DEV_TARGET_MARKETS` remain empty.
-- **Polymarket startup**: `run_polymarket_dev_sync()` runs as a background `asyncio.create_task` — server starts immediately while sync runs in background. Syncs the 5 slugs in `POLYMARKET_DEV_SERIES_SLUGS`, caps at 4 events per series. After sync completes, builds token→event map and starts Polymarket CLOB WS.
-- **Dev config**: `app/core/dev_config.py` defines `POLYMARKET_DEV_SERIES_SLUGS` (5 curated slugs), `DEV_REDIS_FLUSH_INTERVAL` (0.5s), mutable `POLYMARKET_DEV_TOKEN_IDS` + `POLYMARKET_DEV_EVENT_IDS` (populated at startup)
+- **Polymarket startup**: `run_polymarket_dev_sync()` runs as a background `asyncio.create_task` — server starts immediately while sync runs in background. Fetches 200 active series from Gamma API, selects up to 20 diverse series across (category × format_type) buckets (max 2 per bucket), caps at 4 events per series. Falls back to DB token IDs if sync yields 0. After sync completes, builds token→event map and starts Polymarket CLOB WS.
+- **Dev config**: `app/core/dev_config.py` defines `DEV_REDIS_FLUSH_INTERVAL` (0.5s), mutable `POLYMARKET_DEV_TOKEN_IDS` + `POLYMARKET_DEV_EVENT_IDS` (populated at startup). No hardcoded slugs — series selected dynamically.
+- **Polymarket DEV diversity logic**: `_infer_series_format_type()` classifies each series as `binary` / `categorical` / `scalar` using negRisk flag, slug/title keywords, and category hints. `_select_diverse_series()` groups into (category, format) buckets and round-robins to maximize variety.
 - **arq crons**: Only `run_polymarket_state_reconciliation` (every 2 minutes). All Kalshi crons disabled. **arq worker process is still required in DEV_MODE** — run `arq app.core.arq_worker.WorkerSettings` alongside uvicorn.
 - **Dev endpoint**: `POST /api/v1/dev/sync/{exchange}` — returns 403 in prod
-
-**Polymarket DEV series (5 slugs in `POLYMARKET_DEV_SERIES_SLUGS`):**
-- `trump-approval-positive` — Politics, binary approval rating
-- `trump-negative-approval` — Politics
-- `us-annual-inflation` — Economics, recurring monthly
-- `unemployment` — Economics
-- `solana-hit-price-monthly` — Crypto, price range markets
 
 **When DEV_MODE=False (production):**
 - Polymarket WS: loads all token IDs from DB immediately, subscribes to full production set
