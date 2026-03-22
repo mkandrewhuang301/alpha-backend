@@ -18,11 +18,16 @@ import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.routes import categories, events, markets, series
 from app.api.routes.v1 import events as v1_events
 from app.api.routes.v1 import candlesticks as v1_candlesticks
 from app.api.routes.v1 import dev as v1_dev
+from app.api.routes.v1 import users as v1_users
+from app.api.routes.v1 import positions as v1_positions
+from app.api.routes.v1 import orders as v1_orders
+from app.api.routes.v1 import approvals as v1_approvals
 from app.core.config import DEV_MODE
 from app.core.database import init_db, init_asyncpg_pool, close_asyncpg_pool
 from app.core.redis import get_redis, close_redis
@@ -138,6 +143,13 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 app.include_router(series.router, prefix="/series", tags=["series"])
 app.include_router(events.router, prefix="/events", tags=["events"])
 app.include_router(markets.router, prefix="/markets", tags=["markets"])
@@ -145,3 +157,7 @@ app.include_router(categories.router, prefix="/categories", tags=["categories"])
 app.include_router(v1_events.router, prefix="/api/v1", tags=["v1-events"])
 app.include_router(v1_candlesticks.router, prefix="/api/v1", tags=["v1-candlesticks"])
 app.include_router(v1_dev.router, prefix="/api/v1", tags=["v1-dev"])
+app.include_router(v1_users.router, prefix="/api/v1", tags=["v1-users"])
+app.include_router(v1_positions.router, prefix="/api/v1", tags=["v1-positions"])
+app.include_router(v1_orders.router, prefix="/api/v1", tags=["v1-orders"])
+app.include_router(v1_approvals.router, prefix="/api/v1", tags=["v1-approvals"])

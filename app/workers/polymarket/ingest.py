@@ -954,10 +954,14 @@ async def run_polymarket_tag_sync(pool) -> dict:
     # Step 2: Fetch children for each top-level tag (concurrently, 3 at a time).
     # The Gamma API rate-limits aggressively; _fetch_tag_children already retries on
     # 429 with backoff, so keeping concurrency low avoids wasteful retry storms.
-    sem = asyncio.Semaphore(3)
+    # In DEV_MODE, use concurrency=1 + yield between fetches to avoid starving the
+    # FastAPI event loop (which shares the same asyncio loop in dev).
+    sem = asyncio.Semaphore(1 if DEV_MODE else 3)
 
     async def _fetch_children_guarded(parent_id: str):
         async with sem:
+            if DEV_MODE:
+                await asyncio.sleep(0.05)  # yield to event loop between fetches
             children = await _fetch_tag_children(parent_id)
             return parent_id, children
 
