@@ -26,7 +26,9 @@ from app.api.routes.v1 import dev as v1_dev
 from app.api.routes.v1 import users as v1_users
 from app.api.routes.v1 import groups as v1_groups
 from app.api.routes.v1 import messages as v1_messages
-from app.core.config import DEV_MODE
+from app.api.routes.v1 import search as v1_search
+from app.api.routes.v1 import feed as v1_feed
+from app.core.config import DEV_MODE, FCM_ENABLED
 from app.core.database import init_db, init_asyncpg_pool, close_asyncpg_pool
 from app.core.redis import get_redis, close_redis
 # from app.workers.kalshi.stream import run_kalshi_ws  # Kalshi streaming disabled
@@ -55,6 +57,11 @@ async def lifespan(app: FastAPI):
     await init_asyncpg_pool()
     await get_redis()
     logger.info("Connection pools ready (asyncpg + Redis).")
+
+    # Initialize Firebase Admin SDK (gated by FCM_ENABLED)
+    if FCM_ENABLED:
+        from app.services.notifications import init_firebase
+        init_firebase()
 
     if DEV_MODE:
         # Skip Polymarket re-sync — load token IDs directly from DB for faster startup.
@@ -142,3 +149,5 @@ app.include_router(v1_dev.router, prefix="/api/v1", tags=["v1-dev"])
 app.include_router(v1_users.router, prefix="/api/v1", tags=["v1-users"])
 app.include_router(v1_groups.router, prefix="/api/v1", tags=["v1-groups"])
 app.include_router(v1_messages.router, prefix="/api/v1", tags=["v1-messages"])
+app.include_router(v1_search.router, prefix="/api/v1", tags=["v1-search"])
+app.include_router(v1_feed.router, prefix="/api/v1", tags=["v1-feed"])

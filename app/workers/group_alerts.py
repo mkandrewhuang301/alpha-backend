@@ -99,7 +99,10 @@ async def check_price_alerts(ctx: dict) -> None:
                     if shared_price <= 0:
                         continue
                     price_change_pct = abs(current_price - shared_price) / shared_price * 100
-                    if price_change_pct < 10.0:
+                    abs_change = abs(current_price - shared_price)
+                    # Require both 10% relative AND 5pp absolute change to avoid
+                    # near-zero market spam (e.g. 0.001 → 0.05 = 4900% but meaningless)
+                    if price_change_pct < 10.0 or abs_change < 0.05:
                         continue
 
                     # Dedup: skip if identical alert in last 60 min

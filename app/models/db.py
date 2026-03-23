@@ -35,6 +35,8 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID
 from sqlalchemy.orm import relationship
 
+from pgvector.sqlalchemy import Vector
+
 from app.core.database import Base
 
 # ---------------------------------------------------------------------------
@@ -98,6 +100,24 @@ group_member_role_enum = Enum(
 message_type_enum = Enum(
     "text", "image", "trade", "market", "article", "profile", "system",
     name="message_type",
+    create_type=False,
+)
+
+source_domain_enum = Enum(
+    "news", "social", "sports", "crypto", "weather",
+    name="source_domain_type",
+    create_type=False,
+)
+
+impact_level_enum = Enum(
+    "high", "medium", "low",
+    name="impact_level_type",
+    create_type=False,
+)
+
+nlp_status_enum = Enum(
+    "pending", "partial", "complete", "failed",
+    name="nlp_status_type",
     create_type=False,
 )
 
@@ -347,6 +367,7 @@ class Event(Base):
     )
 
     markets = relationship("Market", back_populates="event")
+    intelligence_mappings = relationship("IntelligenceMarketMapping", back_populates="event")
 
 
 class Market(Base):
@@ -409,6 +430,7 @@ class Market(Base):
     outcomes = relationship("MarketOutcome", back_populates="market")
     public_trades = relationship("PublicTrade", back_populates="market")
     user_orders = relationship("UserOrder", back_populates="market")
+    intelligence_mappings = relationship("IntelligenceMarketMapping", back_populates="market")
 
 
 class MarketOutcome(Base):
@@ -677,3 +699,134 @@ class GroupMessage(Base):
     group = relationship("Group", back_populates="messages")
     sender = relationship("User", foreign_keys=[sender_id])
     reply_to = relationship("GroupMessage", remote_side=[id])
+
+
+# ---------------------------------------------------------------------------
+# 6. Intelligence Layer
+#
+#   ExternalIntelligence → IntelligenceMarketMapping → Event / Market
+#   SourceCredibility tracks per-source accuracy over time
+#
+#   Data flow:
+#     Ingestion workers (news/sports) → external_intelligence (raw + embedding)
+#     NLP worker → intelligence_market_mapping (links to events/markets)
+#     Credibility worker → source_credibility (correlation analysis)
+# ---------------------------------------------------------------------------
+
+class ExternalIntelligence(Base):
+    """
+    Ingested external data: news articles, sports injury reports, etc.
+
+    source_domain: broad category (news, sports, crypto, weather, social)
+    source_name:   specific provider ("newsapi", "sportradar", "rotowire")
+    content_hash:  SHA256(source_domain|url|title) for dedup (Redis + DB unique)
+    embedding:     VECTOR(1536) from text-embedding-3-large, populated async by NLP worker
+    nlp_status:    pending → complete (NER+embed done) | partial (one failed) | failed
+    """
+    __tablename__ = "external_intelligence"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    source_domain = Column(source_domain_enum, nullable=False)
+    source_name = Column(String(255), nullable=False)
+    title = Column(Text, nullable=False)
+    raw_text = Column(Text, nullable=False)
+    url = Column(Text, nullable=True)
+    author = Column(String(255), nullable=True)
+    published_at = Column(DateTime(timezone=True), nullable=False)
+    intel_metadata = Column("metadata", JSONB, default=dict, nullable=True)
+    impact_level = Column(impact_level_enum, nullable=False, server_default=text("'low'"))
+    nlp_status = Column(nlp_status_enum, nullable=False, server_default=text("'pending'"))
+    embedding = Column(Vector(1536), nullable=True)
+    content_hash = Column(String(64), nullable=False)
+    is_deleted = Column(Boolean, default=False, nullable=False, server_default=text("false"))
+    created_at = Column(DateTime(timezone=True), server_default=text("NOW()"))
+    updated_at = Column(
+        DateTime(timezone=True),
+        server_default=text("NOW()"),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+
+    __table_args__ = (
+        UniqueConstraint("content_hash", name="uq_external_intelligence_content_hash"),
+        Index("idx_intel_source_published", "source_domain", text("published_at DESC")),
+        Index("idx_intel_impact_level", "impact_level"),
+        Index("idx_intel_nlp_status", "nlp_status"),
+        Index("idx_intel_metadata_gin", "metadata", postgresql_using="gin"),
+    )
+
+    mappings = relationship("IntelligenceMarketMapping", back_populates="intelligence")
+
+
+class IntelligenceMarketMapping(Base):
+    """
+    Junction table linking intelligence items to events (and optionally markets).
+
+    event_id is always required — every mapping anchors to an event for FE correlation.
+    market_id is optional; set only when the intelligence is specifically about one
+    market (e.g., sharp-money signal on a single outcome). All broad tag-based matches
+    produce event-level rows (market_id=NULL).
+
+    matched_tags stores the PlatformTag slugs that produced the match.
+    """
+    __tablename__ = "intelligence_market_mapping"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    intelligence_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("external_intelligence.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    event_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("events.id", ondelete="CASCADE"),
+        nullable=False,  # always required
+    )
+    market_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("markets.id", ondelete="CASCADE"),
+        nullable=True,
+    )
+    confidence_score = Column(Numeric(5, 3), nullable=False)
+    sentiment_polarity = Column(Numeric(5, 3), default=0, server_default=text("0"))
+    matched_tags = Column(ARRAY(Text), default=list)
+    created_at = Column(DateTime(timezone=True), server_default=text("NOW()"))
+
+    __table_args__ = (
+        UniqueConstraint(
+            "intelligence_id", "event_id", "market_id",
+            name="uq_intel_mapping_triple",
+        ),
+        Index("idx_mapping_intelligence", "intelligence_id"),
+        Index("idx_mapping_event", "event_id"),
+        Index("idx_mapping_market", "market_id"),
+    )
+
+    intelligence = relationship("ExternalIntelligence", back_populates="mappings")
+    event = relationship("Event", back_populates="intelligence_mappings")
+    market = relationship("Market", back_populates="intelligence_mappings")
+
+
+class SourceCredibility(Base):
+    """
+    Tracks per-source prediction accuracy over time.
+
+    credibility_score: 0.0-1.0 (seeded at 0.5, updated hourly by credibility worker)
+    domain_scores:     per-category breakdown (JSONB)
+    """
+    __tablename__ = "source_credibility"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    source_domain = Column(source_domain_enum, nullable=False)
+    source_name = Column(String(255), nullable=False)
+    credibility_score = Column(Numeric(5, 3), default=0.5, server_default=text("0.500"))
+    total_predictions = Column(Integer, default=0, server_default=text("0"))
+    correct_predictions = Column(Integer, default=0, server_default=text("0"))
+    avg_lead_time_minutes = Column(Numeric(10, 2), nullable=True)
+    domain_scores = Column(JSONB, default=dict, server_default=text("'{}'"))
+    last_evaluated_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=text("NOW()"))
+    updated_at = Column(
+        DateTime(timezone=True),
+        server_default=text("NOW()"),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )

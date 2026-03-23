@@ -11,7 +11,7 @@ from typing import Any, Optional
 from uuid import UUID
 
 from fastapi import HTTPException
-from pydantic import BaseModel, field_validator
+from pydantic import AnyHttpUrl, BaseModel, field_validator
 from sqlalchemy import select, update, func, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -80,17 +80,17 @@ class MarketMetadata(BaseModel):
 
 
 class ImageMetadata(BaseModel):
-    url: str
+    url: AnyHttpUrl
     width: Optional[int] = None
     height: Optional[int] = None
     mime_type: Optional[str] = None
 
 
 class ArticleMetadata(BaseModel):
-    url: str
+    url: AnyHttpUrl
     title: str
     source: str
-    image_url: Optional[str] = None
+    image_url: Optional[AnyHttpUrl] = None
 
 
 class ProfileMetadata(BaseModel):
@@ -287,6 +287,17 @@ async def add_member(
     if existing:
         raise HTTPException(status_code=409, detail="Already a member of this group")
 
+    # Lock the group row to prevent concurrent joins from exceeding max_members.
+    # SELECT FOR UPDATE ensures two concurrent requests serialize here.
+    locked_group = await db.execute(
+        select(Group).where(Group.id == group_id).with_for_update()
+    )
+    group_row = locked_group.scalar_one_or_none()
+    if not group_row:
+        raise HTTPException(status_code=404, detail="Group not found")
+    if group_row.max_members is not None and group_row.member_count >= group_row.max_members:
+        raise HTTPException(status_code=409, detail="Group is full")
+
     membership = GroupMembership(group_id=group_id, user_id=user_id, role=role)
     db.add(membership)
 
@@ -378,11 +389,11 @@ async def create_message(
                     detail="Cannot share a trade that doesn't belong to you",
                 )
 
-    # Market message: verify the market exists
+    # Market message: verify the market exists and is not deleted
     if msg_type == "market":
         market_meta = MarketMetadata(**metadata)
         market = await db.get(Market, market_meta.market_id)
-        if not market:
+        if not market or market.is_deleted:
             raise HTTPException(status_code=404, detail="Market not found")
 
     message = GroupMessage(
@@ -404,12 +415,31 @@ async def create_message(
             pipe = redis.pipeline()
             for uid in member_ids:
                 if uid != str(sender_id):
-                    unread_key = _unread_key(group_id, _uuid.UUID(uid))
+                    try:
+                        unread_key = _unread_key(group_id, _uuid.UUID(uid))
+                    except ValueError:
+                        logger.warning("Skipping malformed member ID in fan-out: %r", uid)
+                        continue
                     pipe.incr(unread_key)
                     pipe.expire(unread_key, 30 * 86400)  # 30-day TTL
             await pipe.execute()
     except Exception as exc:
         logger.warning("Unread fan-out failed for group %s: %s", group_id, exc)
+
+    # Fire-and-forget: enqueue NLP processing for article messages
+    if msg_type == "article":
+        try:
+            from app.core.config import INTELLIGENCE_ENABLED
+            if INTELLIGENCE_ENABLED:
+                from arq import ArqRedis
+                arq_redis = ArqRedis(pool_or_conn=redis.connection_pool)
+                await arq_redis.enqueue_job(
+                    "run_process_article_intelligence",
+                    str(message.id),
+                    str(group_id),
+                )
+        except Exception as exc:
+            logger.warning("Article NLP enqueue failed for msg %s: %s", message.id, exc)
 
     return message
 

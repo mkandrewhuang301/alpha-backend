@@ -22,7 +22,7 @@ from typing import Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from pydantic import BaseModel, field_validator
+from pydantic import AnyHttpUrl, BaseModel, Field, field_validator
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -52,8 +52,8 @@ router = APIRouter(prefix="/groups")
 class CreateGroupRequest(BaseModel):
     name: str
     slug: Optional[str] = None
-    description: Optional[str] = None
-    avatar_url: Optional[str] = None
+    description: Optional[str] = Field(None, max_length=500)
+    avatar_url: Optional[AnyHttpUrl] = None
     access_type: str = "private"
 
     @field_validator("access_type")
@@ -75,8 +75,8 @@ class CreateGroupRequest(BaseModel):
 
 class UpdateGroupRequest(BaseModel):
     name: Optional[str] = None
-    description: Optional[str] = None
-    avatar_url: Optional[str] = None
+    description: Optional[str] = Field(None, max_length=500)
+    avatar_url: Optional[AnyHttpUrl] = None
 
 
 class UpdateMemberRoleRequest(BaseModel):
@@ -275,7 +275,9 @@ async def delete_group(
 # ---------------------------------------------------------------------------
 
 @router.post("/{group_id}/join", status_code=200)
+@limiter.limit("10/minute")
 async def join_public_group(
+    request: Request,
     group_id: UUID,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
@@ -285,10 +287,6 @@ async def join_public_group(
         raise HTTPException(status_code=404, detail="Group not found")
     if group.access_type != "public":
         raise HTTPException(status_code=403, detail="This is a private group. Use an invite link.")
-
-    # Check max_members
-    if group.max_members is not None and group.member_count >= group.max_members:
-        raise HTTPException(status_code=409, detail="Group is full")
 
     from app.core.redis import get_redis
     redis = await get_redis()

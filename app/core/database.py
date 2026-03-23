@@ -1,6 +1,7 @@
 import logging
 
 import asyncpg
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 from sqlalchemy.orm import DeclarativeBase
 from app.core.config import DATABASE_URL, DEV_MODE
@@ -49,6 +50,8 @@ async def init_db() -> None:
 
         logger.debug("init_db: opening engine connection and creating metadata")
         async with engine.begin() as conn:
+            # Enable pgvector before create_all so VECTOR columns resolve
+            await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
             await conn.run_sync(Base.metadata.create_all)
 
         logger.info("init_db: database initialization completed successfully")
