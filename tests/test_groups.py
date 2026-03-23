@@ -1,9 +1,9 @@
 """
 End-to-end test for groups feature.
-Seeds test users, generates HS256 JWTs, and exercises every group route.
+Seeds test users, generates HS256 JWTs (dev mode), and exercises every group route.
 
 Usage: python3 test_groups.py
-Requires: server running on localhost:8000 + SUPABASE_JWT_SECRET set in .env
+Requires: server running on localhost:8000 with DEV_MODE=true
 """
 
 import asyncio
@@ -15,9 +15,11 @@ import jwt
 BASE = "http://localhost:8000"
 JWT_SECRET = "test-jwt-secret-for-local-dev-only"
 
-# Two test users
-USER_A_SUB = str(uuid.uuid4())
-USER_B_SUB = str(uuid.uuid4())
+# Two test users — privy_did acts as the JWT sub claim
+USER_A_PRIVY_DID = f"did:privy:{uuid.uuid4()}"
+USER_B_PRIVY_DID = f"did:privy:{uuid.uuid4()}"
+USER_A_EOA = f"0x{'a1' * 20}"
+USER_B_EOA = f"0x{'b2' * 20}"
 USER_A_USERNAME = f"testuser_a_{int(time.time())}"
 USER_B_USERNAME = f"testuser_b_{int(time.time())}"
 
@@ -32,23 +34,27 @@ def make_token(sub: str) -> str:
     return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
 
 
-TOKEN_A = make_token(USER_A_SUB)
-TOKEN_B = make_token(USER_B_SUB)
+TOKEN_A = make_token(USER_A_PRIVY_DID)
+TOKEN_B = make_token(USER_B_PRIVY_DID)
 HEADERS_A = {"Authorization": f"Bearer {TOKEN_A}"}
 HEADERS_B = {"Authorization": f"Bearer {TOKEN_B}"}
 
 
 async def seed_users(client: httpx.AsyncClient):
-    """Insert test users directly via DB since we don't have Supabase Auth."""
+    """Insert test users directly via DB."""
     import sys
     sys.path.insert(0, ".")
     from app.core.database import async_session_factory
     from app.models.db import User
 
     async with async_session_factory() as db:
-        for sub, uname in [(USER_A_SUB, USER_A_USERNAME), (USER_B_SUB, USER_B_USERNAME)]:
+        for privy_did, eoa, uname in [
+            (USER_A_PRIVY_DID, USER_A_EOA, USER_A_USERNAME),
+            (USER_B_PRIVY_DID, USER_B_EOA, USER_B_USERNAME),
+        ]:
             user = User(
-                supabase_uid=sub,
+                privy_did=privy_did,
+                eoa_address=eoa,
                 username=uname,
                 display_name=uname.replace("_", " ").title(),
                 email=f"{uname}@test.local",
@@ -68,7 +74,7 @@ async def cleanup_users():
 
     async with async_session_factory() as db:
         # Get user IDs
-        stmt = select(User).where(User.supabase_uid.in_([USER_A_SUB, USER_B_SUB]))
+        stmt = select(User).where(User.privy_did.in_([USER_A_PRIVY_DID, USER_B_PRIVY_DID]))
         result = await db.execute(stmt)
         users = result.scalars().all()
         user_ids = [u.id for u in users]
@@ -330,9 +336,8 @@ async def run_tests():
                         total += 1
 
             # Non-member can't read messages
-            # Create a fresh token for a non-member check
             r = await c.get(f"/api/v1/groups/{private_group_id}/messages", headers={
-                "Authorization": f"Bearer {make_token(str(uuid.uuid4()))}"
+                "Authorization": f"Bearer {make_token(f'did:privy:{uuid.uuid4()}')}"
             })
             # This should fail with 404 (user not found in DB)
             track(check(r, 404, "GET messages (unregistered user) → 404"))
