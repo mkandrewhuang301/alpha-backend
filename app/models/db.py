@@ -166,10 +166,9 @@ class User(Base):
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     email = Column(String(255), unique=True, nullable=False)
-    eoa_address = Column(Text, unique=True, nullable=False)
+    eoa_address = Column(Text, unique=True, nullable=True)
     privy_did = Column(Text, unique=True, nullable=True)  # "did:privy:..." — used for auth token lookup
     password_hash = Column(Text, nullable=True)   # Nullable: Supabase OAuth users have no local hash
-    supabase_uid = Column(Text, unique=True, nullable=True)   # Supabase Auth `sub` claim
     username = Column(String(50), unique=True, nullable=True)  # @handle, 3-50 chars
     display_name = Column(String(100), nullable=True)
     avatar_url = Column(Text, nullable=True)

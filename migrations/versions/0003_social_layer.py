@@ -92,10 +92,11 @@ def upgrade() -> None:
                 "is_verified", sa.Boolean(), server_default="false", nullable=False
             ))
 
-        # Make password_hash nullable (Supabase OAuth users have no local hash)
-        op.execute(text(
-            "ALTER TABLE users ALTER COLUMN password_hash DROP NOT NULL"
-        ))
+        # Make password_hash nullable if it still exists (0002 may have already dropped it)
+        if _col_exists(insp, "users", "password_hash"):
+            op.execute(text(
+                "ALTER TABLE users ALTER COLUMN password_hash DROP NOT NULL"
+            ))
 
         # Unique constraints (safe to re-run: guarded by _constraint_exists)
         if not _constraint_exists(bind, "uq_users_supabase_uid", "users"):
@@ -242,8 +243,9 @@ def downgrade() -> None:
         for col in ["supabase_uid", "username", "display_name", "avatar_url", "bio", "is_verified"]:
             if col in cols:
                 op.drop_column("users", col)
-        # Restore NOT NULL constraint
-        op.execute(text("ALTER TABLE users ALTER COLUMN password_hash SET NOT NULL"))
+        # Restore NOT NULL constraint if password_hash exists
+        if _col_exists(insp, "users", "password_hash"):
+            op.execute(text("ALTER TABLE users ALTER COLUMN password_hash SET NOT NULL"))
 
     for ddl in [
         "DROP TYPE IF EXISTS message_type",

@@ -8,9 +8,7 @@ Auth (Wallet — Privy):
   GET  /api/v1/users/clob/credentials      Check stored CLOB api_key
 
 Auth (Email — Supabase):
-  POST /api/v1/auth/register    {email, password, username}
-  POST /api/v1/auth/login       {email, password} → JWT
-  POST /api/v1/auth/refresh     {refresh_token} → new JWT
+  POST /api/v1/auth/register    {email, eoa_address, privy_did, username?}
 
 Users:
   GET    /api/v1/users/me
@@ -29,13 +27,11 @@ import re
 from typing import Optional
 from uuid import UUID
 
-import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, EmailStr, field_validator
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.config import SUPABASE_ANON_KEY, SUPABASE_URL
 from app.core.database import get_db
 from app.core.limiter import _get_user_key, limiter
 from app.models.db import Account, Group, GroupMembership, User, UserFollow
@@ -98,40 +94,26 @@ class ClobCredentialsResponse(BaseModel):
 
 class RegisterRequest(BaseModel):
     email: EmailStr
-    password: str
-    username: str
-
-    @field_validator("password")
-    @classmethod
-    def _check_password(cls, v: str) -> str:
-        if len(v) < 8:
-            raise ValueError("Password must be at least 8 characters")
-        return v
+    eoa_address: str
+    privy_did: str
+    username: Optional[str] = None
 
     @field_validator("username")
     @classmethod
-    def _check_username(cls, v: str) -> str:
+    def _check_username(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
         v = v.lower()
         if not _USERNAME_RE.match(v):
             raise ValueError("Username must be 3-50 chars, letters/numbers/underscores only")
         return v
 
 
-class LoginRequest(BaseModel):
-    email: EmailStr
-    password: str
-
-
-class RefreshRequest(BaseModel):
-    refresh_token: str
-
-
-class AuthResponse(BaseModel):
-    access_token: str
-    token_type: str
-    expires_in: int
-    refresh_token: str
+class RegisterResponse(BaseModel):
     user_id: str
+    email: str
+    eoa_address: str
+    username: Optional[str]
 
 
 # -- Profile --
@@ -371,7 +353,7 @@ async def get_clob_credentials(
 # Email auth endpoints (Supabase)
 # ---------------------------------------------------------------------------
 
-@router.post("/auth/register", response_model=AuthResponse, status_code=201)
+@router.post("/auth/register", response_model=RegisterResponse, status_code=201)
 @limiter.limit("10/minute")
 async def register(
     request: Request,
@@ -381,10 +363,18 @@ async def register(
     """Register a new user with Supabase Auth and create a profile row in our DB."""
     # 1. Check username uniqueness BEFORE calling Supabase Auth.
     existing = await db.execute(
-        select(User).where(User.username == body.username)
+        select(User).where(User.privy_did == body.privy_did)
     )
     if existing.scalar_one_or_none():
-        raise HTTPException(status_code=409, detail="Username already taken")
+        raise HTTPException(status_code=409, detail="User already registered")
+
+    # Check username uniqueness if provided
+    if body.username:
+        existing_username = await db.execute(
+            select(User).where(User.username == body.username)
+        )
+        if existing_username.scalar_one_or_none():
+            raise HTTPException(status_code=409, detail="Username already taken")
 
     # 2. Create user in Supabase Auth
     data = await _supabase_auth_post("/signup", {
@@ -406,7 +396,8 @@ async def register(
     # 3. Create profile row
     user = User(
         email=body.email,
-        supabase_uid=supabase_uid,
+        eoa_address=body.eoa_address,
+        privy_did=body.privy_did,
         username=body.username,
     )
     db.add(user)
@@ -414,51 +405,13 @@ async def register(
         await db.commit()
     except Exception:
         await db.rollback()
-        raise HTTPException(status_code=409, detail="Email or username already registered")
+        raise HTTPException(status_code=409, detail="Email or wallet address already registered")
 
-    return AuthResponse(
-        access_token=access_token,
-        token_type="bearer",
-        expires_in=expires_in,
-        refresh_token=refresh_token,
+    return RegisterResponse(
         user_id=str(user.id),
-    )
-
-
-@router.post("/auth/login", response_model=AuthResponse)
-@limiter.limit("10/minute")
-async def login(request: Request, body: LoginRequest) -> AuthResponse:
-    """Authenticate with Supabase Auth. Returns JWT."""
-    data = await _supabase_auth_post(
-        "/token?grant_type=password",
-        {"email": body.email, "password": body.password},
-    )
-
-    user = data.get("user") or {}
-    return AuthResponse(
-        access_token=data.get("access_token", ""),
-        token_type="bearer",
-        expires_in=data.get("expires_in", 3600),
-        refresh_token=data.get("refresh_token", ""),
-        user_id=user.get("id", ""),
-    )
-
-
-@router.post("/auth/refresh", response_model=AuthResponse)
-async def refresh_token(request: Request, body: RefreshRequest) -> AuthResponse:
-    """Exchange a refresh token for a new access token."""
-    data = await _supabase_auth_post(
-        "/token?grant_type=refresh_token",
-        {"refresh_token": body.refresh_token},
-    )
-
-    user = data.get("user") or {}
-    return AuthResponse(
-        access_token=data.get("access_token", ""),
-        token_type="bearer",
-        expires_in=data.get("expires_in", 3600),
-        refresh_token=data.get("refresh_token", ""),
-        user_id=user.get("id", ""),
+        email=user.email,
+        eoa_address=user.eoa_address,
+        username=user.username,
     )
 
 
