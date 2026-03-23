@@ -13,6 +13,8 @@ Cron jobs (production):
     - aggregate_ohlcv: every 1 minute (Redis ticks → 1m candles in Postgres)
     - aggregate_event_volumes: every 5 minutes
     - polymarket_state_reconciliation: every 2 minutes
+    - check_price_alerts: every 5 minutes (group alert worker)
+    - check_resolution_alerts: every 2 minutes (group alert worker)
 """
 
 import logging
@@ -95,6 +97,18 @@ async def run_polymarket_state_reconciliation(ctx: dict) -> None:
     await _sync()
 
 
+async def run_check_price_alerts(ctx: dict) -> None:
+    """Detect markets that moved >= 10% since shared in groups; insert system messages."""
+    from app.workers.group_alerts import check_price_alerts
+    await check_price_alerts(ctx)
+
+
+async def run_check_resolution_alerts(ctx: dict) -> None:
+    """Update resolved trade messages and insert resolution system messages."""
+    from app.workers.group_alerts import check_resolution_alerts
+    await check_resolution_alerts(ctx)
+
+
 class WorkerSettings:
     functions = [
         run_kalshi_full_sync,
@@ -102,9 +116,11 @@ class WorkerSettings:
         run_aggregate_ohlcv,
         run_aggregate_event_volumes,
         run_polymarket_state_reconciliation,
+        run_check_price_alerts,
+        run_check_resolution_alerts,
     ]
     # DEV_MODE: only Polymarket reconciliation (Kalshi sync/streaming disabled in dev).
-    # PROD: full suite of Kalshi + Polymarket crons.
+    # PROD: full suite of Kalshi + Polymarket crons + group alert workers.
     _every_2_min = {0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30, 32, 34, 36, 38, 40, 42, 44, 46, 48, 50, 52, 54, 56, 58}
     cron_jobs = [
         cron(run_polymarket_state_reconciliation, minute=_every_2_min),
@@ -114,6 +130,8 @@ class WorkerSettings:
         cron(run_aggregate_ohlcv, minute=set(range(60)), unique=True),
         cron(run_aggregate_event_volumes, minute={0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55}),
         cron(run_polymarket_state_reconciliation, minute=_every_2_min),
+        cron(run_check_price_alerts, minute={0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55}),
+        cron(run_check_resolution_alerts, minute=_every_2_min),
     ]
     on_startup = startup
     on_shutdown = shutdown

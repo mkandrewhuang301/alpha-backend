@@ -21,6 +21,15 @@ ENVIRONMENT = os.getenv("ENVIRONMENT", "development")
 # subset of markets to stay within free-tier Redis Cloud ops/sec limits.
 DEV_MODE = os.getenv("DEV_MODE", "false").lower() in ("true", "1", "yes")
 
+# Supabase — used for Auth JWT verification and user management
+SUPABASE_URL = os.getenv("SUPABASE_URL", "")
+SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY", "")
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
+
+# Optional: Supabase JWT secret for HS256 fallback (older Supabase projects).
+# If not set, only RS256/JWKS verification is used.
+SUPABASE_JWT_SECRET = os.getenv("SUPABASE_JWT_SECRET", "")
+
 # Magic Link — kept for reference, replaced by Privy
 MAGIC_SECRET_KEY = os.getenv("MAGIC_SECRET_KEY", "")
 
