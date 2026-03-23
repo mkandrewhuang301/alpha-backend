@@ -3,8 +3,8 @@
 Adds social coordination layer: user profiles, follows, groups, memberships,
 and group messages. Idempotent — safe to run against any DB state.
 
-Revision ID: 0002_social_layer
-Revises: 0001_complete_schema
+Revision ID: 0003_social_layer
+Revises: 0002_magic_auth_wallet
 Create Date: 2026-03-16
 """
 
@@ -15,8 +15,8 @@ from alembic import op
 from sqlalchemy import inspect, text
 from sqlalchemy.dialects import postgresql
 
-revision: str = "0002_social_layer"
-down_revision: Union[str, Sequence[str], None] = "0001_complete_schema"
+revision: str = "0003_social_layer"
+down_revision: Union[str, Sequence[str], None] = "0002_magic_auth_wallet"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
