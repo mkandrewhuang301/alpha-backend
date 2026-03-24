@@ -359,7 +359,7 @@ async def register(
     request: Request,
     body: RegisterRequest,
     db: AsyncSession = Depends(get_db),
-) -> AuthResponse:
+) -> RegisterResponse:
     """Register a new user with Supabase Auth and create a profile row in our DB."""
     # 1. Check username uniqueness BEFORE calling Supabase Auth.
     existing = await db.execute(

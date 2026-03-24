@@ -30,11 +30,6 @@ from app.api.routes.v1 import orders as v1_orders
 from app.api.routes.v1 import approvals as v1_approvals
 from app.api.routes.v1 import groups as v1_groups
 from app.api.routes.v1 import messages as v1_messages
-from app.api.routes.v1 import positions as v1_positions
-from app.api.routes.v1 import orders as v1_orders
-from app.api.routes.v1 import approvals as v1_approvals
-from app.api.routes.v1 import groups as v1_groups
-from app.api.routes.v1 import messages as v1_messages
 from app.core.config import DEV_MODE
 from app.core.database import init_db, init_asyncpg_pool, close_asyncpg_pool
 from app.core.redis import get_redis, close_redis
@@ -159,11 +154,5 @@ app.include_router(v1_users.router, prefix="/api/v1", tags=["v1-users"])
 app.include_router(v1_positions.router, prefix="/api/v1", tags=["v1-positions"])
 app.include_router(v1_orders.router, prefix="/api/v1", tags=["v1-orders"])
 app.include_router(v1_approvals.router, prefix="/api/v1", tags=["v1-approvals"])
-app.include_router(v1_groups.router, prefix="/api/v1", tags=["v1-groups"])
-app.include_router(v1_messages.router, prefix="/api/v1", tags=["v1-messages"])
-app.include_router(v1_positions.router, prefix="/api/v1", tags=["v1-positions"])
-app.include_router(v1_orders.router, prefix="/api/v1", tags=["v1-orders"])
-app.include_router(v1_approvals.router, prefix="/api/v1", tags=["v1-approvals"])
-app.include_router(v1_users.router, prefix="/api/v1", tags=["v1-users"])
 app.include_router(v1_groups.router, prefix="/api/v1", tags=["v1-groups"])
 app.include_router(v1_messages.router, prefix="/api/v1", tags=["v1-messages"])

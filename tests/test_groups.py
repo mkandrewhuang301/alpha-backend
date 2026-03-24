@@ -1,8 +1,8 @@
 """
 End-to-end test for groups feature.
-Seeds test users, generates HS256 JWTs (dev mode), and exercises every group route.
+Seeds test users via dev API, generates HS256 JWTs (dev mode), and exercises every group route.
 
-Usage: python3 test_groups.py
+Usage: python3 tests/test_groups.py
 Requires: server running on localhost:8000 with DEV_MODE=true
 """
 
@@ -41,63 +41,22 @@ HEADERS_B = {"Authorization": f"Bearer {TOKEN_B}"}
 
 
 async def seed_users(client: httpx.AsyncClient):
-    """Insert test users directly via DB."""
-    import sys
-    sys.path.insert(0, ".")
-    from app.core.database import async_session_factory
-    from app.models.db import User
-
-    async with async_session_factory() as db:
-        for privy_did, eoa, uname in [
-            (USER_A_PRIVY_DID, USER_A_EOA, USER_A_USERNAME),
-            (USER_B_PRIVY_DID, USER_B_EOA, USER_B_USERNAME),
-        ]:
-            user = User(
-                privy_did=privy_did,
-                eoa_address=eoa,
-                username=uname,
-                display_name=uname.replace("_", " ").title(),
-                email=f"{uname}@test.local",
-            )
-            db.add(user)
-        await db.commit()
-        print(f"  Seeded users: {USER_A_USERNAME}, {USER_B_USERNAME}")
-
-
-async def cleanup_users():
-    """Remove test users."""
-    import sys
-    sys.path.insert(0, ".")
-    from sqlalchemy import delete, select
-    from app.core.database import async_session_factory
-    from app.models.db import User, UserFollow, GroupMembership, GroupMessage, Group
-
-    async with async_session_factory() as db:
-        # Get user IDs
-        stmt = select(User).where(User.privy_did.in_([USER_A_PRIVY_DID, USER_B_PRIVY_DID]))
-        result = await db.execute(stmt)
-        users = result.scalars().all()
-        user_ids = [u.id for u in users]
-
-        if user_ids:
-            # Delete group messages by sender
-            await db.execute(delete(GroupMessage).where(GroupMessage.sender_id.in_(user_ids)))
-            # Delete system messages in groups owned by test users
-            groups_stmt = select(Group.id).where(Group.owner_id.in_(user_ids))
-            groups_result = await db.execute(groups_stmt)
-            group_ids = [g[0] for g in groups_result.fetchall()]
-            if group_ids:
-                await db.execute(delete(GroupMessage).where(GroupMessage.group_id.in_(group_ids)))
-                await db.execute(delete(GroupMembership).where(GroupMembership.group_id.in_(group_ids)))
-                await db.execute(delete(Group).where(Group.id.in_(group_ids)))
-            # Delete memberships and follows
-            await db.execute(delete(GroupMembership).where(GroupMembership.user_id.in_(user_ids)))
-            await db.execute(delete(UserFollow).where(UserFollow.follower_id.in_(user_ids)))
-            await db.execute(delete(UserFollow).where(UserFollow.followed_id.in_(user_ids)))
-            # Delete users
-            await db.execute(delete(User).where(User.id.in_(user_ids)))
-            await db.commit()
-            print(f"  Cleaned up {len(users)} test users and related data")
+    """Insert test users via dev API."""
+    for privy_did, eoa, uname in [
+        (USER_A_PRIVY_DID, USER_A_EOA, USER_A_USERNAME),
+        (USER_B_PRIVY_DID, USER_B_EOA, USER_B_USERNAME),
+    ]:
+        r = await client.post("/api/v1/dev/seed-user", json={
+            "privy_did": privy_did,
+            "eoa_address": eoa,
+            "email": f"{uname}@test.local",
+            "username": uname,
+            "display_name": uname.replace("_", " ").title(),
+        })
+        if r.status_code not in (200, 201):
+            print(f"  FAIL seeding user {uname}: {r.status_code} {r.text[:200]}")
+            raise RuntimeError(f"Failed to seed user: {r.text[:200]}")
+    print(f"  Seeded users: {USER_A_USERNAME}, {USER_B_USERNAME}")
 
 
 def check(resp: httpx.Response, expected: int, label: str):
@@ -436,10 +395,6 @@ async def run_tests():
         print(f"\n{'='*50}")
         print(f"RESULTS: {passed}/{total} passed, {failed} failed")
         print(f"{'='*50}")
-
-        # Cleanup
-        print("\n=== Cleaning up ===")
-        await cleanup_users()
 
         return failed == 0
 
