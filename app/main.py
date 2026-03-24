@@ -28,6 +28,7 @@ from app.api.routes.v1 import groups as v1_groups
 from app.api.routes.v1 import messages as v1_messages
 from app.api.routes.v1 import search as v1_search
 from app.api.routes.v1 import feed as v1_feed
+from app.api.routes.v1 import intelligence_stream as v1_intelligence_stream
 from app.core.config import DEV_MODE, FCM_ENABLED
 from app.core.database import init_db, init_asyncpg_pool, close_asyncpg_pool
 from app.core.redis import get_redis, close_redis
@@ -151,3 +152,4 @@ app.include_router(v1_groups.router, prefix="/api/v1", tags=["v1-groups"])
 app.include_router(v1_messages.router, prefix="/api/v1", tags=["v1-messages"])
 app.include_router(v1_search.router, prefix="/api/v1", tags=["v1-search"])
 app.include_router(v1_feed.router, prefix="/api/v1", tags=["v1-feed"])
+app.include_router(v1_intelligence_stream.router, prefix="/api/v1", tags=["v1-intelligence-stream"])

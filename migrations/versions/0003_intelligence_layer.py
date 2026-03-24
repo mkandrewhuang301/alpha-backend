@@ -1,8 +1,8 @@
 """intelligence_layer
 
 Adds intelligence synchronization engine: pgvector extension, external_intelligence
-table with VECTOR(1536) embeddings, intelligence-market mapping, source credibility
-tracking, and VECTOR columns on events/markets for semantic search.
+table with VECTOR(768) embeddings, intelligence-market mapping with price_at_publish,
+source credibility tracking, and VECTOR columns on events/markets for semantic search.
 
 Idempotent — safe to run against any DB state.
 
@@ -104,9 +104,9 @@ def upgrade() -> None:
             sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.text("NOW()")),
             sa.UniqueConstraint("content_hash", name="uq_external_intelligence_content_hash"),
         )
-        # Vector column added separately (requires pgvector extension)
+        # Vector column (768 dims — text-embedding-3-large with dimensions=768)
         op.execute(text(
-            "ALTER TABLE external_intelligence ADD COLUMN embedding vector(1536)"
+            "ALTER TABLE external_intelligence ADD COLUMN embedding vector(768)"
         ))
         # Indexes
         op.create_index(
@@ -120,7 +120,13 @@ def upgrade() -> None:
             "idx_intel_metadata_gin", "external_intelligence",
             ["metadata"], postgresql_using="gin",
         )
-        # HNSW index for vector similarity search (partial: only non-deleted with embeddings)
+        # Composite index for feed queries
+        op.create_index(
+            "idx_intel_feed",
+            "external_intelligence",
+            ["is_deleted", "nlp_status", sa.text("created_at DESC")],
+        )
+        # HNSW index for vector similarity search
         op.execute(text(
             "CREATE INDEX idx_intel_embedding_hnsw ON external_intelligence "
             "USING hnsw (embedding vector_cosine_ops) "
@@ -138,18 +144,15 @@ def upgrade() -> None:
                       nullable=False),
             sa.Column("event_id", postgresql.UUID(as_uuid=True),
                       sa.ForeignKey("events.id", ondelete="CASCADE"),
-                      nullable=True),
+                      nullable=False),
             sa.Column("market_id", postgresql.UUID(as_uuid=True),
                       sa.ForeignKey("markets.id", ondelete="CASCADE"),
                       nullable=True),
             sa.Column("confidence_score", sa.Numeric(5, 3), nullable=False),
             sa.Column("sentiment_polarity", sa.Numeric(5, 3), server_default="0.000"),
             sa.Column("matched_tags", postgresql.ARRAY(sa.Text()), server_default="{}"),
+            sa.Column("price_at_publish", sa.Numeric(10, 6), nullable=True),
             sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.text("NOW()")),
-            sa.CheckConstraint(
-                "event_id IS NOT NULL OR market_id IS NOT NULL",
-                name="ck_mapping_has_target",
-            ),
             sa.UniqueConstraint(
                 "intelligence_id", "event_id", "market_id",
                 name="uq_intel_mapping_triple",
@@ -158,6 +161,13 @@ def upgrade() -> None:
         op.create_index("idx_mapping_intelligence", "intelligence_market_mapping", ["intelligence_id"])
         op.create_index("idx_mapping_event", "intelligence_market_mapping", ["event_id"])
         op.create_index("idx_mapping_market", "intelligence_market_mapping", ["market_id"])
+    else:
+        # Add price_at_publish if missing
+        if not _col_exists(insp, "intelligence_market_mapping", "price_at_publish"):
+            op.add_column(
+                "intelligence_market_mapping",
+                sa.Column("price_at_publish", sa.Numeric(10, 6), nullable=True),
+            )
 
     # ------------------------------------------------- source_credibility
     if not _table_exists(insp, "source_credibility"):
@@ -180,18 +190,18 @@ def upgrade() -> None:
             sa.UniqueConstraint("source_domain", "source_name", name="uq_source_credibility_domain_name"),
         )
 
-    # ---------------------------------------- ALTER events: add embedding
+    # ---------------------------------------- ALTER events: add embedding (768 dims)
     if _table_exists(insp, "events") and not _col_exists(insp, "events", "embedding"):
-        op.execute(text("ALTER TABLE events ADD COLUMN embedding vector(1536)"))
+        op.execute(text("ALTER TABLE events ADD COLUMN embedding vector(768)"))
         op.execute(text(
             "CREATE INDEX idx_events_embedding_hnsw ON events "
             "USING hnsw (embedding vector_cosine_ops) "
             "WHERE embedding IS NOT NULL"
         ))
 
-    # ---------------------------------------- ALTER markets: add embedding
+    # ---------------------------------------- ALTER markets: add embedding (768 dims)
     if _table_exists(insp, "markets") and not _col_exists(insp, "markets", "embedding"):
-        op.execute(text("ALTER TABLE markets ADD COLUMN embedding vector(1536)"))
+        op.execute(text("ALTER TABLE markets ADD COLUMN embedding vector(768)"))
         op.execute(text(
             "CREATE INDEX idx_markets_embedding_hnsw ON markets "
             "USING hnsw (embedding vector_cosine_ops) "
@@ -210,29 +220,7 @@ def upgrade() -> None:
             "ON CONFLICT (source_domain, source_name) DO NOTHING"
         ).bindparams(domain=domain, name=name))
 
-    # ---- intelligence_market_mapping: event_id NOT NULL ----
-    # Original schema had event_id nullable (either event OR market required).
-    # Redesigned: event_id is always required for FE correlation; market_id is
-    # an optional future field for market-specific intelligence.
-    bind.execute(text(
-        "DELETE FROM intelligence_market_mapping WHERE event_id IS NULL"
-    ))
-    # Drop old check constraint if present, then make event_id NOT NULL
-    if _constraint_exists(bind, "ck_mapping_has_target", "intelligence_market_mapping"):
-        op.drop_constraint("ck_mapping_has_target", "intelligence_market_mapping")
-    # Check if event_id is still nullable before altering
-    col_info = next(
-        (c for c in inspect(bind).get_columns("intelligence_market_mapping")
-         if c["name"] == "event_id"),
-        None,
-    )
-    if col_info and col_info.get("nullable", True):
-        op.alter_column("intelligence_market_mapping", "event_id", nullable=False)
-
     # ---- Fix idx_messages_market_ref partial index from migration 0002 ----
-    # The original index only covered type IN ('market', 'system') but the
-    # resolution alert worker queries type IN ('market', 'trade'). Rebuild
-    # the index to include 'trade' so resolution lookups use the index.
     if _index_exists_pg(bind, "idx_messages_market_ref"):
         op.execute("DROP INDEX idx_messages_market_ref")
     op.execute(
@@ -271,5 +259,5 @@ def downgrade() -> None:
     ]:
         op.execute(ddl)
 
-    # Drop pgvector extension (careful — only if no other tables use it)
+    # Drop pgvector extension
     op.execute("DROP EXTENSION IF EXISTS vector")

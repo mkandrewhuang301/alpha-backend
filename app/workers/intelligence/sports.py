@@ -348,6 +348,147 @@ def _handle_sportradar_http_error(e: httpx.HTTPStatusError, sport: str, endpoint
 
 
 # ---------------------------------------------------------------------------
+# Fast-path: immediate matching + notification for high-impact sports items
+# ---------------------------------------------------------------------------
+
+async def _fast_path_match_and_notify(
+    pool, redis, arq_redis, high_impact_items: list[tuple]
+) -> None:
+    """
+    Bypass the NLP queue for high-impact sports items. Uses structured
+    metadata (sport, team, player) to match events directly via tag overlap,
+    then dispatches notifications immediately.
+
+    Still enqueues NLP for embedding generation — this only accelerates
+    the notification path.
+    """
+    import json
+
+    try:
+        async with pool.acquire() as conn:
+            for uid, item in high_impact_items:
+                meta = item.get("metadata", {})
+                sport = meta.get("sport", "")
+                team = meta.get("team", "")
+                player = meta.get("player", "")
+
+                # Build candidate tag slugs from structured metadata
+                from app.services.nlp_entities import _slugify
+                candidates = set()
+                if sport:
+                    candidates.add(_slugify(sport))
+                    candidates.add(sport.lower())
+                if team:
+                    candidates.add(_slugify(team))
+                    for word in team.split():
+                        slug = _slugify(word)
+                        if len(slug) >= 3:
+                            candidates.add(slug)
+                if player:
+                    candidates.add(_slugify(player))
+                    parts = player.split()
+                    if len(parts) > 1:
+                        candidates.add(_slugify(parts[-1]))
+
+                candidate_list = list(candidates)
+                if not candidate_list:
+                    continue
+
+                # Find matching events via GIN tag overlap
+                event_rows = await conn.fetch(
+                    """
+                    SELECT id FROM events
+                    WHERE is_deleted = false
+                      AND tags && $1::varchar[]
+                    LIMIT 20
+                    """,
+                    candidate_list,
+                )
+
+                if not event_rows:
+                    continue
+
+                event_ids = [r["id"] for r in event_rows]
+                sentiment = -0.7 if item["impact_level"] == "high" else 0.0
+
+                # Get primary market prices from Redis for price_at_publish
+                price_map = {}
+                outcome_rows = await conn.fetch(
+                    """
+                    SELECT m.event_id, m.exchange, mo.execution_asset_id
+                    FROM markets m
+                    JOIN market_outcomes mo ON mo.market_id = m.id AND mo.side = 'yes'
+                    WHERE m.event_id = ANY($1) AND m.is_deleted = false
+                    ORDER BY m.event_id, m.volume DESC NULLS LAST
+                    """,
+                    event_ids,
+                )
+                if outcome_rows:
+                    pipe = redis.pipeline(transaction=False)
+                    lookup_eids = []
+                    for orow in outcome_rows:
+                        key = f"ticker:{orow['exchange']}:{orow['execution_asset_id']}"
+                        pipe.hget(key, "price")
+                        lookup_eids.append(orow["event_id"])
+                    results = await pipe.execute()
+                    for idx, val in enumerate(results):
+                        if val is not None and lookup_eids[idx] not in price_map:
+                            try:
+                                price_map[lookup_eids[idx]] = float(val)
+                            except (ValueError, TypeError):
+                                pass
+
+                # Insert mappings
+                mapping_rows = [
+                    (uid, eid, 0.7, sentiment, candidate_list, price_map.get(eid))
+                    for eid in event_ids
+                ]
+                await conn.executemany(
+                    """
+                    INSERT INTO intelligence_market_mapping
+                        (id, intelligence_id, event_id, confidence_score,
+                         sentiment_polarity, matched_tags, price_at_publish)
+                    VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6)
+                    ON CONFLICT (intelligence_id, event_id, market_id) DO NOTHING
+                    """,
+                    mapping_rows,
+                )
+
+                # Dispatch notification immediately
+                event_id_strs = [str(eid) for eid in event_ids]
+                await arq_redis.enqueue_job(
+                    "run_dispatch_intelligence_alerts",
+                    str(uid),
+                    "high",
+                    event_id_strs,
+                    [],  # no market-level IDs for fast-path
+                )
+
+                # Publish to SSE
+                try:
+                    payload = json.dumps({
+                        "id": str(uid),
+                        "title": item["title"],
+                        "summary": item["raw_text"][:200],
+                        "source_domain": "sports",
+                        "impact_level": "high",
+                        "matched_tags": candidate_list,
+                    })
+                    await redis.publish("intel:feed:global", payload)
+                except Exception:
+                    pass  # SSE publish is best-effort
+
+                logger.info(
+                    "[sports] Fast-path: %s matched %d events, notification dispatched",
+                    item["title"][:60],
+                    len(event_ids),
+                )
+
+    except Exception as e:
+        logger.error("[sports] Fast-path matching failed: %s", e, exc_info=True)
+
+
+# ---------------------------------------------------------------------------
 # Main cron task
 # ---------------------------------------------------------------------------
 
@@ -417,13 +558,29 @@ async def ingest_sports_data(ctx: dict) -> None:
             from arq import ArqRedis
 
             arq_redis = ArqRedis(pool_or_conn=redis.connection_pool)
+
+            # --- Fast-path: high-impact items get immediate event matching ---
+            # Skip the NLP queue for notifications — sports metadata is already
+            # structured enough to find matching events directly.
+            high_impact_items = [
+                (uid, item) for uid, item in zip(inserted_ids, items_to_insert)
+                if item["impact_level"] == "high"
+            ]
+
+            if high_impact_items:
+                await _fast_path_match_and_notify(
+                    pool, redis, arq_redis, high_impact_items
+                )
+
+            # Still enqueue ALL items for NLP (embedding generation + refinement)
             for i in range(0, len(inserted_ids), 10):
                 batch = [str(uid) for uid in inserted_ids[i:i + 10]]
                 await arq_redis.enqueue_job("run_process_intelligence_nlp_batch", batch)
 
             logger.info(
-                "[sports] Inserted %d items (%d NLP batches)",
+                "[sports] Inserted %d items (%d high-impact fast-path, %d NLP batches)",
                 len(inserted_ids),
+                len(high_impact_items),
                 (len(inserted_ids) + 9) // 10,
             )
 

@@ -14,6 +14,7 @@ SPORTRADAR_TIER = os.getenv("SPORTRADAR_TIER", "trial")  # "trial" or "productio
 FIREBASE_CREDENTIALS_JSON = os.getenv("FIREBASE_CREDENTIALS_JSON", "")
 FCM_ENABLED = os.getenv("FCM_ENABLED", "false").lower() in ("true", "1", "yes")
 INTELLIGENCE_ENABLED = os.getenv("INTELLIGENCE_ENABLED", "false").lower() in ("true", "1", "yes")
+NEWSAPI_POLL_INTERVAL_SECONDS = int(os.getenv("NEWSAPI_POLL_INTERVAL_SECONDS", "120"))
 
 # PostgreSQL via Supabase — format: postgresql+asyncpg://user:pass@host:port/db
 DATABASE_URL = os.getenv("DATABASE_URL", "")

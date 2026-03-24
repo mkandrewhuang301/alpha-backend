@@ -66,7 +66,10 @@ app/
 │       ├── dev.py             # Manual sync (DEV_MODE only, 403 in prod)
 │       ├── users.py           # Auth, profiles, follows, unread
 │       ├── groups.py          # Group CRUD, membership, invite links, discovery
-│       └── messages.py        # Group messages — send/list/delete
+│       ├── messages.py        # Group messages — send/list/delete
+│       ├── search.py          # Semantic search (pgvector + optional RAG)
+│       ├── feed.py            # Personalized intelligence feed
+│       └── intelligence_stream.py  # SSE real-time feed via Redis Pub/Sub
 ├── models/
 │   ├── db.py                  # SQLAlchemy ORM (all tables). ENUMs: create_type=False
 │   ├── kalshi.py              # Pydantic — Kalshi API. Prices in cents (0-100), normalize to 0.0-1.0
@@ -77,7 +80,13 @@ app/
 │   ├── candlesticks.py        # Historical + live merge
 │   ├── auth.py                # Supabase JWT (JWKS RS256 + HS256 fallback) + get_current_user
 │   ├── groups.py              # Group/membership/message logic + unread fan-out
-│   └── [planned: polymarket, sportradar, openai, firebase, weather]
+│   ├── search.py              # Semantic search across markets/events/intelligence
+│   ├── feed.py                # Ranked feed: exposure + credibility + recency
+│   ├── notifications.py       # Firebase FCM push + intelligence alert dispatch
+│   ├── nlp_client.py          # Singleton async OpenAI client
+│   ├── nlp_entities.py        # Tiered NER: local keyword match → GPT-4o fallback
+│   ├── nlp_embeddings.py      # text-embedding-3-large (768 dims)
+│   └── nlp_rag.py             # Optional RAG synthesis for search
 ├── workers/
 │   ├── kalshi/ingest.py       # Full sync + delta + OHLCV aggregation (prod crons)
 │   ├── kalshi/stream.py       # WS firehose (DISABLED)
@@ -85,14 +94,24 @@ app/
 │   ├── polymarket/stream.py   # CLOB WS → Redis + resolution detection
 │   ├── taxonomy.py            # upsert_platform_tag(), slugify()
 │   ├── group_alerts.py        # price_alerts (5m) + resolution_alerts (2m)
-│   └── [planned: injury, lineup, market, whale monitors]
+│   └── intelligence/
+│       ├── base.py            # content_hash, redis dedup, bulk_insert_intelligence
+│       ├── news.py            # NewsAPI ingestion (configurable 2-5min cron)
+│       ├── sports.py          # Sportradar ingestion (2min) + fast-path notifications
+│       ├── nlp_worker.py      # Tiered NER + embeddings + unified matching engine
+│       ├── credibility.py     # Hourly source accuracy evaluation
+│       ├── embedding_backfill.py  # Backfill market/event embeddings (10min)
+│       ├── notification_dispatch.py  # FCM push for high-impact alerts
+│       ├── group_integration.py  # System messages + article intelligence
+│       └── stream.py          # Abstract IntelligenceStream base (ready for future feeds)
 ├── core/
 │   ├── config.py, dev_config.py, database.py, redis.py
 │   ├── arq_worker.py          # DEV: polymarket reconciliation only. PROD: full suite
 │   └── limiter.py             # Rate limiting
 migrations/versions/
 ├── 0001_complete_schema.py    # Core schema (idempotent)
-└── 0002_social_layer.py       # Social tables + user profile columns
+├── 0002_social_layer.py       # Social tables + user profile columns
+└── 0003_intelligence_layer.py # Intelligence: pgvector, embeddings(768), mapping, credibility
 ```
 
 ---
@@ -110,11 +129,16 @@ Key patterns:
 - **PlatformTag**: unified taxonomy — `parent_ids ARRAY(text)` (GIN), slug/label/force_hide/platform_metadata JSONB
 - **SportsMetadata**: `(exchange, sport)` composite PK, `tag_ids ARRAY(text)` GIN
 - **Social tables**: user_follows, groups (access_type, invite_code, member_count), group_memberships (role enum, last_read_at), group_messages (type: text|image|trade|market|article|profile|system, metadata JSONB, reply_to_id)
+- **Intelligence tables**: external_intelligence (source_domain enum, embedding VECTOR(768), nlp_status, content_hash dedup), intelligence_market_mapping (event_id required, market_id optional, confidence_score from unified matching, price_at_publish snapshot, matched_tags), source_credibility (per-source accuracy tracking)
+- **Embeddings**: VECTOR(768) on external_intelligence, events, markets — HNSW indexes for cosine similarity
+- **Matching engine**: Unified confidence = (tag_score × 0.5) + (cosine_similarity × 0.5). Tags-only: ×0.7 cap. Embedding-only: ×0.6 cap. Threshold: 0.3
 - Numeric precision: money = `NUMERIC(24,8)` + `Decimal`. Prices = `NUMERIC(10,6)`. Never `float` for money.
 
 **Redis keys:**
 - `ticker:{exchange}:{execution_asset_id}` — HSET: price, bid, bid_size, ask, ask_size, volume_24h, ts
 - `candle:kalshi:{ticker}:{minute_ts}` — live OHLCV, 5-min TTL, basis points (0-10000)
+- `intel:feed:global` — Pub/Sub channel for real-time SSE feed
+- `intel_tags_cache` — cached PlatformTag slugs for NER (5-min TTL)
 - Prefix is `ticker:` not `market:`
 
 ---
@@ -155,7 +179,7 @@ Key patterns:
 
 ## Environment Variables
 
-See `.env.example` for full list. Key ones: `DATABASE_URL`, `REDIS_URL`, `KALSHI_API_KEY_ID`, `KALSHI_PRIVATE_KEY`, `POLYMARKET_API_KEY`, `SUPABASE_URL`, `SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY`, `OPENAI_API_KEY`, `DEV_MODE`, `ENVIRONMENT`.
+See `.env.example` for full list. Key ones: `DATABASE_URL`, `REDIS_URL`, `KALSHI_API_KEY_ID`, `KALSHI_PRIVATE_KEY`, `POLYMARKET_API_KEY`, `SUPABASE_URL`, `SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY`, `OPENAI_API_KEY`, `DEV_MODE`, `ENVIRONMENT`, `INTELLIGENCE_ENABLED`, `NEWSAPI_KEY`, `SPORTRADAR_API_KEY`, `SPORTRADAR_TIER`, `FCM_ENABLED`, `FIREBASE_CREDENTIALS_JSON`, `NEWSAPI_POLL_INTERVAL_SECONDS`.
 
 ---
 
@@ -165,7 +189,7 @@ See `.env.example` for full list. Key ones: `DATABASE_URL`, `REDIS_URL`, `KALSHI
 2. ✅ Supabase auth + social layer (profiles, follows, groups, chat, alerts, migration 0002)
 3. ✅ Polymarket ingestion (CLOB WS, Gamma sync, taxonomy, resolution detection)
 4. ✅ Group betting social layer (squads, channels, invite links, 7 message types, alerts)
-5. Sports data pipeline → injury detection → OpenAI synthesis → Firebase notifications
+5. ✅ Intelligence engine: news/sports ingestion, tiered NER, unified matching (tags+embeddings), SSE real-time feed, credibility tracking, push notifications
 6. Full API ready for iOS
 
 **Ship in order. Do not skip ahead.**

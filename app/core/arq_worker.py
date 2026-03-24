@@ -36,7 +36,7 @@ import logging
 from arq import cron
 from arq.connections import RedisSettings
 
-from app.core.config import REDIS_URL, DEV_MODE, INTELLIGENCE_ENABLED
+from app.core.config import REDIS_URL, DEV_MODE, INTELLIGENCE_ENABLED, NEWSAPI_POLL_INTERVAL_SECONDS
 
 logger = logging.getLogger(__name__)
 
@@ -216,9 +216,17 @@ class WorkerSettings:
     _every_10_min = {0, 10, 20, 30, 40, 50}
     _every_10_min_offset5 = {5, 15, 25, 35, 45, 55}
 
+    # News poll interval: convert seconds to minute set
+    # 120s (2min) → _every_2_min, 300s (5min) → _every_5_min
+    _news_poll_minutes = (
+        _every_2_min if NEWSAPI_POLL_INTERVAL_SECONDS <= 120
+        else _every_5_min if NEWSAPI_POLL_INTERVAL_SECONDS <= 300
+        else _every_10_min
+    )
+
     # Intelligence crons (only in PROD with INTELLIGENCE_ENABLED)
     _intel_crons = [
-        cron(run_ingest_news, minute=_every_5_min),
+        cron(run_ingest_news, minute=_news_poll_minutes),
         cron(run_ingest_sports, minute=_every_2_min),
         cron(run_backfill_market_embeddings, minute=_every_10_min),
         cron(run_backfill_event_embeddings, minute=_every_10_min_offset5),

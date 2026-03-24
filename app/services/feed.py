@@ -124,20 +124,22 @@ async def ranked_feed(
             for r in cred_rows
         }
 
-        # Fetch intelligence items with their matched tags
+        # Fetch intelligence items with pre-aggregated tags via subquery
+        # (avoids expensive LATERAL unnest + re-aggregate per row)
         query = f"""
             SELECT ei.id, ei.title, ei.raw_text, ei.source_domain, ei.source_name,
                    ei.url, ei.impact_level, ei.published_at, ei.metadata,
                    ei.created_at,
-                   COALESCE(
-                       array_agg(DISTINCT unnest_tag) FILTER (WHERE unnest_tag IS NOT NULL),
-                       ARRAY[]::text[]
-                   ) AS matched_tags
+                   COALESCE(tag_agg.all_tags, ARRAY[]::text[]) AS matched_tags
             FROM external_intelligence ei
-            LEFT JOIN intelligence_market_mapping imm ON imm.intelligence_id = ei.id
-            LEFT JOIN LATERAL unnest(imm.matched_tags) AS unnest_tag ON true
+            LEFT JOIN (
+                SELECT intelligence_id,
+                       array_agg(DISTINCT tag) AS all_tags
+                FROM intelligence_market_mapping,
+                     LATERAL unnest(matched_tags) AS tag
+                GROUP BY intelligence_id
+            ) tag_agg ON tag_agg.intelligence_id = ei.id
             WHERE {where_clause}
-            GROUP BY ei.id
             ORDER BY ei.created_at DESC
             LIMIT ${param_idx}
         """

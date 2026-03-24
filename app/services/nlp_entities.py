@@ -1,8 +1,14 @@
 """
 NER + entity disambiguation via OpenAI function calling.
 
-One-shot extraction: given raw text and a list of valid PlatformTag slugs,
-returns matched tags with confidence, sentiment polarity, impact level, and summary.
+Two-tier approach:
+    Tier 1 (local, <10ms): keyword/metadata matching against known tag slugs.
+        Sports items use structured metadata (player, team, sport).
+        News items use title tokenization for slug containment.
+        If 2+ tags match with high confidence → skip GPT-4o.
+
+    Tier 2 (GPT-4o, ~1.5s): full NER with function calling for articles
+        that tier 1 couldn't confidently resolve.
 
 Critical: output validation rejects any slug NOT in the provided available_tags list.
 Never blindly trust LLM output for DB operations.
@@ -10,6 +16,7 @@ Never blindly trust LLM output for DB operations.
 
 import json
 import logging
+import re
 
 from app.services.nlp_client import _get_openai_client
 
@@ -64,12 +71,146 @@ EXTRACTION_FUNCTION = {
     },
 }
 
+# Negative sentiment keywords for tier 1 heuristic
+_NEGATIVE_KEYWORDS = frozenset({
+    "injury", "injured", "out", "doubtful", "questionable", "suspended",
+    "cut", "released", "traded", "waived", "ir", "il", "dfa",
+    "loss", "lost", "defeat", "eliminated", "fired", "crash", "decline",
+    "investigation", "fraud", "lawsuit", "charged", "arrested",
+})
+
+_POSITIVE_KEYWORDS = frozenset({
+    "signed", "extension", "activated", "return", "returning", "comeback",
+    "win", "won", "victory", "surge", "rally", "growth", "upgrade",
+    "cleared", "healthy", "probable", "approved", "deal",
+})
+
+
+def _slugify(text: str) -> str:
+    """Convert text to slug form for matching."""
+    return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+
+
+def _estimate_sentiment(text: str) -> float:
+    """Quick sentiment estimate from keyword presence."""
+    lower = text.lower()
+    neg_count = sum(1 for kw in _NEGATIVE_KEYWORDS if kw in lower)
+    pos_count = sum(1 for kw in _POSITIVE_KEYWORDS if kw in lower)
+    total = neg_count + pos_count
+    if total == 0:
+        return 0.0
+    return max(-1.0, min(1.0, (pos_count - neg_count) / total))
+
+
+def tier1_keyword_match(
+    text: str,
+    metadata: dict,
+    available_tags: list[str],
+) -> dict | None:
+    """
+    Tier 1 local NER: match text/metadata against known tag slugs without LLM.
+
+    For sports items (metadata has event_type/player/team/sport):
+        Uses structured fields to find matching slugs directly.
+
+    For news items:
+        Tokenizes title/text, checks for exact slug containment.
+
+    Returns a result dict if 2+ tags match, else None (fall through to GPT-4o).
+    """
+    available_set = set(available_tags)
+    matched_tags = []
+
+    event_type = metadata.get("event_type")  # "injury", "transaction"
+    sport = metadata.get("sport")
+    player = metadata.get("player")
+    team = metadata.get("team")
+    to_team = metadata.get("to_team")
+
+    if event_type and sport:
+        # Sports item — use structured metadata for precise matching
+        candidates = set()
+
+        # Try sport slug
+        if sport:
+            candidates.add(_slugify(sport))
+            candidates.add(sport.lower())
+
+        # Try team slugs (various forms)
+        for t in [team, to_team]:
+            if t:
+                candidates.add(_slugify(t))
+                # Try individual words (e.g., "Lakers" from "Los Angeles Lakers")
+                for word in t.split():
+                    slug = _slugify(word)
+                    if len(slug) >= 3:
+                        candidates.add(slug)
+
+        # Try player slug
+        if player:
+            candidates.add(_slugify(player))
+            # Last name only
+            parts = player.split()
+            if len(parts) > 1:
+                candidates.add(_slugify(parts[-1]))
+
+        # Match against available tags
+        for candidate in candidates:
+            if candidate in available_set:
+                matched_tags.append({"slug": candidate, "confidence": 0.9})
+            else:
+                # Partial match: check if candidate is a substring of any tag
+                for tag in available_tags[:500]:  # limit scan
+                    if candidate in tag or tag in candidate:
+                        matched_tags.append({"slug": tag, "confidence": 0.7})
+                        break
+
+    else:
+        # News/other item — tokenize and check for slug containment
+        # Use title + first 300 chars of text
+        search_text = text[:300].lower()
+        tokens = set(re.findall(r"[a-z0-9]+(?:-[a-z0-9]+)*", search_text))
+
+        for tag in available_tags[:500]:  # limit scan for performance
+            tag_lower = tag.lower()
+            # Exact token match
+            if tag_lower in tokens:
+                matched_tags.append({"slug": tag, "confidence": 0.85})
+            # Tag appears as substring in text (for multi-word slugs like "nba-finals")
+            elif len(tag_lower) >= 4 and tag_lower in search_text:
+                matched_tags.append({"slug": tag, "confidence": 0.75})
+
+    # Deduplicate by slug
+    seen = set()
+    unique_tags = []
+    for t in matched_tags:
+        if t["slug"] not in seen:
+            seen.add(t["slug"])
+            unique_tags.append(t)
+
+    # Need 2+ matches to be confident enough to skip GPT-4o
+    if len(unique_tags) < 2:
+        return None
+
+    # Use metadata impact_level if available, otherwise heuristic
+    impact = metadata.get("impact_level") or "low"
+    if impact not in ("high", "medium", "low"):
+        impact = "low"
+
+    return {
+        "matched_tags": unique_tags,
+        "sentiment_polarity": _estimate_sentiment(text),
+        "impact_level": impact,
+        "summary": text[:200].split(". ")[0] + "." if text else "",
+    }
+
 
 async def extract_entities_and_match(
     text: str, available_tags: list[str]
 ) -> dict:
     """
-    Extract entities from text and match against known PlatformTag slugs.
+    Tier 2: Extract entities from text via GPT-4o function calling and match
+    against known PlatformTag slugs.
 
     Returns:
         {

@@ -349,6 +349,7 @@ class Event(Base):
     open_interest = Column(Numeric(24, 8), default=0)
 
     platform_metadata = Column(JSONB, default=dict)
+    embedding = Column(Vector(768), nullable=True)
     is_deleted = Column(Boolean, default=False)
     created_at = Column(DateTime(timezone=True), server_default=text("NOW()"))
     updated_at = Column(DateTime(timezone=True), server_default=text("NOW()"), onupdate=lambda: datetime.now(timezone.utc))
@@ -411,6 +412,7 @@ class Market(Base):
     liquidity = Column(Numeric(24, 8), default=0)
 
     platform_metadata = Column(JSONB, default=dict)
+    embedding = Column(Vector(768), nullable=True)
 
     is_deleted = Column(Boolean, default=False)
     created_at = Column(DateTime(timezone=True), server_default=text("NOW()"))
@@ -720,7 +722,7 @@ class ExternalIntelligence(Base):
     source_domain: broad category (news, sports, crypto, weather, social)
     source_name:   specific provider ("newsapi", "sportradar", "rotowire")
     content_hash:  SHA256(source_domain|url|title) for dedup (Redis + DB unique)
-    embedding:     VECTOR(1536) from text-embedding-3-large, populated async by NLP worker
+    embedding:     VECTOR(768) from text-embedding-3-large (768 dims), populated async by NLP worker
     nlp_status:    pending → complete (NER+embed done) | partial (one failed) | failed
     """
     __tablename__ = "external_intelligence"
@@ -736,7 +738,7 @@ class ExternalIntelligence(Base):
     intel_metadata = Column("metadata", JSONB, default=dict, nullable=True)
     impact_level = Column(impact_level_enum, nullable=False, server_default=text("'low'"))
     nlp_status = Column(nlp_status_enum, nullable=False, server_default=text("'pending'"))
-    embedding = Column(Vector(1536), nullable=True)
+    embedding = Column(Vector(768), nullable=True)
     content_hash = Column(String(64), nullable=False)
     is_deleted = Column(Boolean, default=False, nullable=False, server_default=text("false"))
     created_at = Column(DateTime(timezone=True), server_default=text("NOW()"))
@@ -789,6 +791,7 @@ class IntelligenceMarketMapping(Base):
     confidence_score = Column(Numeric(5, 3), nullable=False)
     sentiment_polarity = Column(Numeric(5, 3), default=0, server_default=text("0"))
     matched_tags = Column(ARRAY(Text), default=list)
+    price_at_publish = Column(Numeric(10, 6), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=text("NOW()"))
 
     __table_args__ = (

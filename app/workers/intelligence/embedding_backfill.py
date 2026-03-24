@@ -1,15 +1,16 @@
 """
-Embedding backfill workers — populate VECTOR(1536) columns for existing
+Embedding backfill workers — populate VECTOR(768) columns for existing
 markets and events that were created before the intelligence engine.
 
 Two arq cron tasks:
     backfill_market_embeddings  — every 10 min, batch 100 markets with NULL embedding
     backfill_event_embeddings   — every 10 min (offset 5), batch 100 events
 
-Generates embedding from:
-    Markets: title + rules_primary + subtitle
-    Events: title + description + categories
+Generates embedding from rich metadata:
+    Markets: title + subtitle + rules_primary + categories + exchange + status
+    Events: title + description + categories + tags + exchange
 
+Uses batch UPDATE via UNNEST for efficiency (no per-row round-trips).
 Stops once all rows have embeddings (no-op cron).
 """
 
@@ -22,10 +23,43 @@ logger = logging.getLogger(__name__)
 BACKFILL_BATCH_SIZE = 100
 
 
+def _build_market_text(row: dict) -> str:
+    """Build rich embedding text from market metadata."""
+    parts = [row["title"] or ""]
+    if row.get("subtitle"):
+        parts.append(row["subtitle"])
+    if row.get("rules_primary"):
+        parts.append(row["rules_primary"])
+    # Markets don't have categories — include event categories if available
+    if row.get("event_categories"):
+        parts.append(" ".join(row["event_categories"]))
+    if row.get("exchange"):
+        parts.append(f"Exchange: {row['exchange']}")
+    if row.get("status"):
+        parts.append(f"Status: {row['status']}")
+    return " ".join(parts).strip()
+
+
+def _build_event_text(row: dict) -> str:
+    """Build rich embedding text from event metadata."""
+    parts = [row["title"] or ""]
+    if row.get("description"):
+        parts.append(row["description"])
+    cats = row.get("categories")
+    if cats:
+        parts.append(" ".join(cats))
+    tags = row.get("tags")
+    if tags:
+        parts.append(" ".join(tags))
+    if row.get("exchange"):
+        parts.append(f"Exchange: {row['exchange']}")
+    return " ".join(parts).strip()
+
+
 async def backfill_market_embeddings(ctx: dict) -> None:
     """
     arq cron: backfill embedding column on markets table.
-    Processes up to 100 markets per invocation.
+    Processes up to 100 markets per invocation using batch UPDATE.
     """
     try:
         pool = ctx["asyncpg_pool"]
@@ -33,10 +67,12 @@ async def backfill_market_embeddings(ctx: dict) -> None:
         async with pool.acquire() as conn:
             rows = await conn.fetch(
                 """
-                SELECT id, title, subtitle,
-                       platform_metadata->>'rules_primary' as rules_primary
-                FROM markets
-                WHERE embedding IS NULL AND is_deleted = false
+                SELECT m.id, m.title, m.subtitle, m.exchange, m.status,
+                       m.platform_metadata->>'rules_primary' as rules_primary,
+                       e.categories as event_categories
+                FROM markets m
+                LEFT JOIN events e ON e.id = m.event_id
+                WHERE m.embedding IS NULL AND m.is_deleted = false
                 LIMIT $1
                 """,
                 BACKFILL_BATCH_SIZE,
@@ -46,33 +82,28 @@ async def backfill_market_embeddings(ctx: dict) -> None:
             logger.debug("[backfill] No markets need embedding backfill")
             return
 
-        # Build text for each market
         texts = []
         ids = []
         for row in rows:
-            parts = [row["title"] or ""]
-            if row.get("rules_primary"):
-                parts.append(row["rules_primary"])
-            if row.get("subtitle"):
-                parts.append(row["subtitle"])
-            texts.append(" ".join(parts).strip())
+            texts.append(_build_market_text(dict(row)))
             ids.append(row["id"])
 
-        # Batch generate embeddings
         embeddings = await generate_embeddings_batch(texts)
 
-        # Update markets with embeddings
+        # Batch UPDATE via UNNEST — single round-trip
+        embedding_strs = [str(e) for e in embeddings]
         async with pool.acquire() as conn:
-            for i, market_id in enumerate(ids):
-                await conn.execute(
-                    """
-                    UPDATE markets
-                    SET embedding = $2::vector, updated_at = NOW()
-                    WHERE id = $1
-                    """,
-                    market_id,
-                    str(embeddings[i]),
-                )
+            await conn.execute(
+                """
+                UPDATE markets AS m
+                SET embedding = data.emb::vector,
+                    updated_at = NOW()
+                FROM UNNEST($1::uuid[], $2::text[]) AS data(mid, emb)
+                WHERE m.id = data.mid
+                """,
+                ids,
+                embedding_strs,
+            )
 
         logger.info("[backfill] Updated embeddings for %d markets", len(ids))
 
@@ -85,7 +116,7 @@ async def backfill_market_embeddings(ctx: dict) -> None:
 async def backfill_event_embeddings(ctx: dict) -> None:
     """
     arq cron: backfill embedding column on events table.
-    Processes up to 100 events per invocation.
+    Processes up to 100 events per invocation using batch UPDATE.
     """
     try:
         pool = ctx["asyncpg_pool"]
@@ -93,7 +124,7 @@ async def backfill_event_embeddings(ctx: dict) -> None:
         async with pool.acquire() as conn:
             rows = await conn.fetch(
                 """
-                SELECT id, title, description, categories
+                SELECT id, title, description, categories, tags, exchange
                 FROM events
                 WHERE embedding IS NULL AND is_deleted = false
                 LIMIT $1
@@ -105,34 +136,28 @@ async def backfill_event_embeddings(ctx: dict) -> None:
             logger.debug("[backfill] No events need embedding backfill")
             return
 
-        # Build text for each event
         texts = []
         ids = []
         for row in rows:
-            parts = [row["title"] or ""]
-            if row.get("description"):
-                parts.append(row["description"])
-            cats = row.get("categories")
-            if cats:
-                parts.append(" ".join(cats))
-            texts.append(" ".join(parts).strip())
+            texts.append(_build_event_text(dict(row)))
             ids.append(row["id"])
 
-        # Batch generate embeddings
         embeddings = await generate_embeddings_batch(texts)
 
-        # Update events with embeddings
+        # Batch UPDATE via UNNEST — single round-trip
+        embedding_strs = [str(e) for e in embeddings]
         async with pool.acquire() as conn:
-            for i, event_id in enumerate(ids):
-                await conn.execute(
-                    """
-                    UPDATE events
-                    SET embedding = $2::vector, updated_at = NOW()
-                    WHERE id = $1
-                    """,
-                    event_id,
-                    str(embeddings[i]),
-                )
+            await conn.execute(
+                """
+                UPDATE events AS e
+                SET embedding = data.emb::vector,
+                    updated_at = NOW()
+                FROM UNNEST($1::uuid[], $2::text[]) AS data(eid, emb)
+                WHERE e.id = data.eid
+                """,
+                ids,
+                embedding_strs,
+            )
 
         logger.info("[backfill] Updated embeddings for %d events", len(ids))
 

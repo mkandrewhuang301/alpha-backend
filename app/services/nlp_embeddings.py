@@ -1,7 +1,8 @@
 """
 Vector embedding generation via OpenAI text-embedding-3-large.
 
-Truncated to 1536 dimensions via the API's `dimensions` parameter.
+Truncated to 768 dimensions via the API's `dimensions` parameter.
+768 dims retains 95%+ retrieval quality at half the cost and storage.
 Used by NLP worker (batch) and search endpoint (single query).
 """
 
@@ -12,7 +13,7 @@ from app.services.nlp_client import _get_openai_client
 logger = logging.getLogger(__name__)
 
 EMBEDDING_MODEL = "text-embedding-3-large"
-EMBEDDING_DIMENSIONS = 1536
+EMBEDDING_DIMENSIONS = 768
 
 
 async def generate_embedding(text: str) -> list[float]:
