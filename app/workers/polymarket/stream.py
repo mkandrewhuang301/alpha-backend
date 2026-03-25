@@ -691,6 +691,15 @@ async def _redis_flusher(redis_conn) -> None:
                 # Refresh TTL on every write so active markets never expire.
                 # Resolved/archived markets stop receiving updates and self-prune after 48h.
                 pipe.expire(u.redis_key, TICKER_KEY_TTL)
+
+                # Live buffer: append {t, p} tick to a Redis list for chart stitching.
+                # The iOS app reads this via the chart endpoint to get sub-minute
+                # price movements that the historical API doesn't capture.
+                live_buffer_key = f"live_buffer:poly:{u.token_id}"
+                tick_json = json.dumps({"t": int(u.ts), "p": float(u.price)})
+                pipe.rpush(live_buffer_key, tick_json)
+                pipe.expire(live_buffer_key, 300)  # 5-min TTL
+
             await pipe.execute()
 
             # Phase 2: ZADD trending — skipped here. Volume comes from the
