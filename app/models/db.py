@@ -24,6 +24,7 @@ from sqlalchemy import (
     DateTime,
     Enum,
     ForeignKey,
+    Integer,
     Numeric,
     String,
     Text,
@@ -80,6 +81,24 @@ market_status_enum = Enum(
 platform_tag_type_enum = Enum(
     "category", "tag",
     name="platform_tag_type",
+)
+
+group_access_type_enum = Enum(
+    "private", "public",
+    name="group_access_type",
+    create_type=False,
+)
+
+group_member_role_enum = Enum(
+    "owner", "admin", "member", "follower",
+    name="group_member_role",
+    create_type=False,
+)
+
+message_type_enum = Enum(
+    "text", "image", "trade", "market", "article", "profile", "system",
+    name="message_type",
+    create_type=False,
 )
 
 
@@ -147,8 +166,14 @@ class User(Base):
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     email = Column(String(255), unique=True, nullable=False)
-    eoa_address = Column(Text, unique=True, nullable=False)
+    eoa_address = Column(Text, unique=True, nullable=True)
     privy_did = Column(Text, unique=True, nullable=True)  # "did:privy:..." — used for auth token lookup
+    password_hash = Column(Text, nullable=True)   # Nullable: Supabase OAuth users have no local hash
+    username = Column(String(50), unique=True, nullable=True)  # @handle, 3-50 chars
+    display_name = Column(String(100), nullable=True)
+    avatar_url = Column(Text, nullable=True)
+    bio = Column(Text, nullable=True)
+    is_verified = Column(Boolean, default=False, nullable=False, server_default=text("false"))
     created_at = Column(DateTime(timezone=True), server_default=text("NOW()"))
     updated_at = Column(DateTime(timezone=True), server_default=text("NOW()"), onupdate=lambda: datetime.now(timezone.utc))
 
@@ -538,3 +563,119 @@ class UserOrder(Base):
     account = relationship("Account", back_populates="orders")
     market = relationship("Market", back_populates="user_orders")
     outcome = relationship("MarketOutcome", back_populates="user_orders")
+
+
+# ---------------------------------------------------------------------------
+# 5. Social Layer
+# ---------------------------------------------------------------------------
+
+class UserFollow(Base):
+    """Directed follow relationship between users."""
+    __tablename__ = "user_follows"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    follower_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    followed_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=text("NOW()"))
+
+    __table_args__ = (
+        UniqueConstraint("follower_id", "followed_id", name="uq_user_follows_pair"),
+        Index("idx_user_follows_follower", "follower_id"),
+        Index("idx_user_follows_followed", "followed_id"),
+    )
+
+
+class Group(Base):
+    """
+    A betting squad or public channel.
+    private: invite-only, max 50 members, invite_code required to join.
+    public: discoverable, no cap (max_members=None), join directly.
+    """
+    __tablename__ = "groups"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    name = Column(String(100), nullable=False)
+    slug = Column(String(100), nullable=False)   # URL-safe, unique
+    description = Column(Text, nullable=True)
+    avatar_url = Column(Text, nullable=True)
+    access_type = Column(group_access_type_enum, nullable=False, server_default="private")
+    owner_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="RESTRICT"), nullable=False)
+    invite_code = Column(String(32), nullable=True)   # secrets.token_hex(16); NULL for public
+    max_members = Column(Integer, nullable=True)       # NULL = unlimited
+    member_count = Column(Integer, nullable=False, server_default=text("0"))   # denormalized
+    is_deleted = Column(Boolean, default=False, nullable=False, server_default=text("false"))
+    created_at = Column(DateTime(timezone=True), server_default=text("NOW()"))
+    updated_at = Column(
+        DateTime(timezone=True),
+        server_default=text("NOW()"),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+
+    __table_args__ = (
+        UniqueConstraint("slug", name="uq_groups_slug"),
+    )
+
+    memberships = relationship("GroupMembership", back_populates="group")
+    messages = relationship("GroupMessage", back_populates="group")
+
+
+class GroupMembership(Base):
+    """Tracks a user's membership in a group with their role."""
+    __tablename__ = "group_memberships"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    group_id = Column(UUID(as_uuid=True), ForeignKey("groups.id", ondelete="CASCADE"), nullable=False)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    role = Column(group_member_role_enum, nullable=False, server_default="member")
+    last_read_at = Column(DateTime(timezone=True), nullable=True)   # for unread persistence
+    joined_at = Column(DateTime(timezone=True), server_default=text("NOW()"))
+
+    __table_args__ = (
+        UniqueConstraint("group_id", "user_id", name="uq_group_memberships_pair"),
+        Index("idx_memberships_user", "user_id"),
+        Index("idx_memberships_group", "group_id"),
+        Index("idx_memberships_group_role", "group_id", "role"),
+    )
+
+    group = relationship("Group", back_populates="memberships")
+    user = relationship("User")
+
+
+class GroupMessage(Base):
+    """
+    A message in a group chat.
+
+    type=text:    content field carries the message
+    type=image:   metadata.{url, width, height, mime_type}
+    type=trade:   metadata.{source, record_id, snapshot, resolved, profit_pct}
+    type=market:  metadata.{exchange, market_id, shared_yes_price, snapshot}
+    type=article: metadata.{url, title, source, image_url}
+    type=profile: metadata.{user_id, username, display_name, avatar_url}
+    type=system:  metadata.{event, market_id?, detail}   — sender_id is NULL
+    """
+    __tablename__ = "group_messages"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    group_id = Column(UUID(as_uuid=True), ForeignKey("groups.id", ondelete="CASCADE"), nullable=False)
+    sender_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    type = Column(message_type_enum, nullable=False)
+    content = Column(Text, nullable=True)
+    msg_metadata = Column("metadata", JSONB, default=dict, nullable=True)
+    reply_to_id = Column(UUID(as_uuid=True), ForeignKey("group_messages.id", ondelete="SET NULL"), nullable=True)
+    is_deleted = Column(Boolean, default=False, nullable=False, server_default=text("false"))
+    created_at = Column(DateTime(timezone=True), server_default=text("NOW()"))
+    updated_at = Column(
+        DateTime(timezone=True),
+        server_default=text("NOW()"),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+
+    __table_args__ = (
+        Index("idx_messages_group_created", "group_id", text("created_at DESC")),
+        Index("idx_messages_sender", "sender_id"),
+        Index("idx_messages_metadata_gin", "metadata", postgresql_using="gin"),
+    )
+
+    group = relationship("Group", back_populates="messages")
+    sender = relationship("User", foreign_keys=[sender_id])
+    reply_to = relationship("GroupMessage", remote_side=[id])

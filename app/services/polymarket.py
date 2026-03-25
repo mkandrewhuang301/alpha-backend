@@ -274,6 +274,7 @@ async def deploy_safe(eoa_address: str, signature: str) -> SafeDeployResult:
                 poll_data = poll_data[0] if poll_data else {}
             state = poll_data.get("state", "")
             logger.info("Poll response: %s", poll_data)
+            logger.info("Poll response: %s", poll_data)
 
             if state == "STATE_MINED":
                 return SafeDeployResult(

@@ -35,6 +35,11 @@ def upgrade() -> None:
         op.add_column("users", sa.Column("eoa_address", sa.Text(), nullable=True))
         op.create_unique_constraint("uq_users_eoa_address", "users", ["eoa_address"])
 
+    # -- users: add privy_did
+    if not _column_exists(insp, "users", "privy_did"):
+        op.add_column("users", sa.Column("privy_did", sa.Text(), nullable=True))
+        op.create_unique_constraint("uq_users_privy_did", "users", ["privy_did"])
+
     # -- accounts: add safe_address
     if not _column_exists(insp, "accounts", "safe_address"):
         op.add_column("accounts", sa.Column("safe_address", sa.Text(), nullable=True))
@@ -48,6 +53,11 @@ def downgrade() -> None:
     if _column_exists(insp, "accounts", "safe_address"):
         op.drop_constraint("uq_accounts_safe_address", "accounts", type_="unique")
         op.drop_column("accounts", "safe_address")
+
+    # -- users: remove privy_did
+    if _column_exists(insp, "users", "privy_did"):
+        op.drop_constraint("uq_users_privy_did", "users", type_="unique")
+        op.drop_column("users", "privy_did")
 
     # -- users: remove eoa_address, restore password_hash
     if _column_exists(insp, "users", "eoa_address"):

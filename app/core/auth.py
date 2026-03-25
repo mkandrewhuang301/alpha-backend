@@ -16,7 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
 from app.models.db import User
-from app.services.privy import _decode_token
+from app.services.auth import _decode_token
 
 
 async def get_authenticated_eoa(
@@ -34,7 +34,7 @@ async def get_authenticated_eoa(
     token = authorization[7:]
     try:
         payload = _decode_token(token)
-    except ValueError as e:
+    except Exception as e:
         raise HTTPException(status_code=401, detail=str(e))
 
     privy_did = payload.get("sub", "")

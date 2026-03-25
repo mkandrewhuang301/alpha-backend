@@ -11,14 +11,15 @@ h11==0.16.0
 httpx==0.28.1
 kalshi-python-async==3.2.0
 PyJWT>=2.8.0
-# magic-admin>=2.0.0  # replaced by Privy
 psycopg2-binary>=2.9.0
 py-clob-client>=0.14.0
 pycparser==3.0
 pydantic==2.12.5
 pydantic_core==2.41.5
+PyJWT>=2.8.0
 python-dotenv==1.2.1
 redis[hiredis]>=5.0.0
+slowapi>=0.1.9
 SQLAlchemy[asyncio]==2.0.41
 starlette==0.52.1
 urllib3>=2.0.0
